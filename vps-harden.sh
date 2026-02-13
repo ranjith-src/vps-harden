@@ -5,14 +5,15 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
 LOG_FILE="/var/log/vps-harden-$(date +%Y%m%d-%H%M%S).log"
 readonly LOG_FILE
-readonly ALL_MODULES="prereqs user ssh firewall fail2ban sysctl netbird firewall_tighten sops upgrades shell misc verify"
+readonly ALL_MODULES="prereqs user ssh firewall fail2ban sysctl netbird firewall_tighten sops upgrades monitoring shell misc verify"
 readonly SOPS_FALLBACK_VERSION="3.9.4"
 
 # ── Color output ─────────────────────────────────────────────────────────────
 USE_COLOR="true"
+RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; NC=''
 setup_colors() {
     if [[ "$USE_COLOR" == "true" ]] && [[ -t 1 ]]; then
         RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -77,9 +78,9 @@ run_cmd() {
     fi
     log_raw "[CMD] $*"
     if [[ "$VERBOSE" == "true" ]]; then
-        "$@" 2>&1 | tee -a "$LOG_FILE"
+        DEBIAN_FRONTEND=noninteractive "$@" 2>&1 | tee -a "$LOG_FILE"
     else
-        "$@" >> "$LOG_FILE" 2>&1
+        DEBIAN_FRONTEND=noninteractive "$@" >> "$LOG_FILE" 2>&1
     fi
 }
 
@@ -179,7 +180,7 @@ Optional:
 
 Modules (execution order):
   prereqs user ssh firewall fail2ban sysctl netbird firewall_tighten
-  sops upgrades shell misc verify
+  sops upgrades monitoring shell misc verify
 
 Examples:
   # New VPS:
@@ -801,6 +802,142 @@ mod_upgrades() {
     fi
 }
 
+# ── Module: monitoring ───────────────────────────────────────────────────────
+mod_monitoring() {
+    log_header "Module: monitoring"
+
+    # ── Install auditd + logwatch ────────────────────────────────────────
+    local pkgs=(auditd audispd-plugins logwatch)
+    local to_install=()
+
+    for pkg in "${pkgs[@]}"; do
+        if dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
+            log_info "$pkg already installed"
+        else
+            to_install+=("$pkg")
+        fi
+    done
+
+    if [[ ${#to_install[@]} -gt 0 ]]; then
+        log_info "Installing: ${to_install[*]}"
+        run_cmd apt-get update -qq
+        run_cmd apt-get install -y -qq "${to_install[@]}"
+    fi
+
+    # ── Audit rules ──────────────────────────────────────────────────────
+    local audit_rules="/etc/audit/rules.d/vps-harden.rules"
+    local desired_rules
+    desired_rules=$(cat <<'AUDITEOF'
+## vps-harden.sh — audit rules
+
+# SSH config changes
+-w /etc/ssh/sshd_config -p wa -k ssh_config
+-w /etc/ssh/sshd_config.d/ -p wa -k ssh_config
+
+# User/password database
+-w /etc/passwd -p wa -k user_db
+-w /etc/shadow -p wa -k user_db
+-w /etc/group -p wa -k user_db
+-w /etc/gshadow -p wa -k user_db
+
+# Sudoers changes
+-w /etc/sudoers -p wa -k sudoers_changes
+-w /etc/sudoers.d/ -p wa -k sudoers_changes
+
+# Firewall config
+-w /etc/ufw/ -p wa -k firewall_config
+
+# Cron changes
+-w /etc/crontab -p wa -k cron_changes
+-w /etc/cron.d/ -p wa -k cron_changes
+-w /var/spool/cron/ -p wa -k cron_changes
+
+# Privilege escalation
+-a always,exit -F arch=b64 -S setuid -S setgid -k priv_esc
+AUDITEOF
+)
+
+    if [[ -f "$audit_rules" ]] && diff -q <(echo "$desired_rules") "$audit_rules" &>/dev/null; then
+        log_info "Audit rules already correct"
+    else
+        echo "$desired_rules" | write_file "$audit_rules" 640
+        if [[ "$DRY_RUN" != "true" ]]; then
+            run_cmd systemctl enable auditd
+            run_cmd systemctl restart auditd
+            # Reload rules (augenrules merges rules.d/ into audit.rules)
+            run_cmd augenrules --load
+        fi
+    fi
+
+    # ── Logwatch config ──────────────────────────────────────────────────
+    local logwatch_conf="/etc/logwatch/conf/logwatch.conf"
+    local desired_logwatch
+    desired_logwatch=$(cat <<'LWEOF'
+# vps-harden.sh — logwatch configuration
+Output = stdout
+Format = text
+Detail = Low
+Range = yesterday
+Service = All
+LWEOF
+)
+
+    if [[ "$DRY_RUN" != "true" ]]; then
+        mkdir -p /etc/logwatch/conf
+    fi
+
+    if [[ -f "$logwatch_conf" ]] && diff -q <(echo "$desired_logwatch") "$logwatch_conf" &>/dev/null; then
+        log_info "Logwatch config already correct"
+    else
+        echo "$desired_logwatch" | write_file "$logwatch_conf" 644
+    fi
+
+    # ── Install server-report ────────────────────────────────────────────
+    local report_src
+    report_src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/server-report"
+    local report_dest="/usr/local/bin/server-report"
+
+    if [[ -f "$report_src" ]]; then
+        if [[ -f "$report_dest" ]] && diff -q "$report_src" "$report_dest" &>/dev/null; then
+            log_info "server-report already installed and up-to-date"
+        else
+            if [[ "$DRY_RUN" == "true" ]]; then
+                log_dry "Install server-report to $report_dest"
+            else
+                cp "$report_src" "$report_dest"
+                chmod 755 "$report_dest"
+                chown root:root "$report_dest"
+                log_info "Installed server-report to $report_dest"
+            fi
+        fi
+    else
+        log_warn "server-report source not found at $report_src — skipping install"
+    fi
+
+    # ── Sudoers rule ─────────────────────────────────────────────────────
+    local sudoers_file="/etc/sudoers.d/server-report"
+    local desired_sudoers="${USERNAME} ALL=(root) NOPASSWD: /usr/local/bin/server-report"
+
+    if [[ -f "$sudoers_file" ]] && grep -qF "$desired_sudoers" "$sudoers_file" 2>/dev/null; then
+        log_info "Sudoers rule for server-report already exists"
+    else
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_dry "Write sudoers rule to $sudoers_file"
+        else
+            echo "$desired_sudoers" > "$sudoers_file"
+            chmod 440 "$sudoers_file"
+            chown root:root "$sudoers_file"
+            # Validate with visudo
+            if visudo -cf "$sudoers_file" &>/dev/null; then
+                log_info "Sudoers rule installed and validated"
+            else
+                log_fail "Sudoers file failed validation — removing"
+                rm -f "$sudoers_file"
+            fi
+        fi
+    fi
+}
+
 # ── Module: shell ────────────────────────────────────────────────────────────
 mod_shell() {
     log_header "Module: shell"
@@ -1008,6 +1145,38 @@ mod_verify() {
         sc_add "PASS" "Martian logging enabled"
     else
         sc_add "WARN" "Martian logging disabled"
+    fi
+
+    # Auditd
+    if command -v auditctl &>/dev/null; then
+        if systemctl is-active auditd &>/dev/null; then
+            sc_add "PASS" "auditd active"
+            local audit_rule_count
+            audit_rule_count=$(auditctl -l 2>/dev/null | grep -cv "^No rules" || echo 0)
+            if [[ "$audit_rule_count" -gt 0 ]]; then
+                sc_add "PASS" "Audit rules loaded ($audit_rule_count rules)"
+            else
+                sc_add "WARN" "auditd active but no rules loaded"
+            fi
+        else
+            sc_add "WARN" "auditd installed but not active"
+        fi
+    else
+        sc_add "WARN" "auditd not installed"
+    fi
+
+    # Logwatch
+    if command -v logwatch &>/dev/null; then
+        sc_add "PASS" "logwatch installed"
+    else
+        sc_add "WARN" "logwatch not installed"
+    fi
+
+    # server-report
+    if [[ -x /usr/local/bin/server-report ]]; then
+        sc_add "PASS" "server-report installed"
+    else
+        sc_add "WARN" "server-report not installed"
     fi
 
     # Netbird

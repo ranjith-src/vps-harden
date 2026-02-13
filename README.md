@@ -67,6 +67,7 @@ Modules run in this order. Each is idempotent — safe to re-run.
 | `firewall_tighten` | Allows traffic on VPN tunnel, restricts SSH to safety IP, removes broad SSH rules |
 | `sops` | Installs SOPS + age for encrypted secrets management, generates keypair |
 | `upgrades` | Enables unattended-upgrades, optional auto-reboot |
+| `monitoring` | Installs auditd + logwatch, deploys audit rules, installs [`server-report`](#server-report) CLI, adds sudoers NOPASSWD rule |
 | `shell` | Sets umask 027, configures bash history, scans for plaintext secrets |
 | `misc` | Sets timezone/hostname, locks root password, restricts `su` to sudo group |
 | `verify` | Runs all checks and prints a security scorecard |
@@ -93,6 +94,19 @@ The `verify` module prints a scorecard at the end:
 - **PASS** — correctly configured
 - **WARN** — not critical but should be reviewed
 - **FAIL** — security issue that needs fixing
+
+## server-report
+
+The `monitoring` module installs a companion CLI for quick health checks:
+
+```bash
+sudo server-report summary   # Uptime, load, memory, disk, SSH, services, updates
+sudo server-report auth       # Failed/successful logins, sessions, banned IPs
+sudo server-report audit      # Audit events by key (ssh_config, user_db, etc.)
+sudo server-report full       # Full logwatch report (today)
+```
+
+All output is plain text with no colors — safe for piping, logging, or chatbot consumption. Commands degrade gracefully if tools (auditd, logwatch, fail2ban) are not installed.
 
 ## Config File
 

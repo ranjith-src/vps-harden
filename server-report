@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# server-report — Compact VPS health reports for humans and bots
+# https://github.com/ranjith-src/vps-harden
+# Usage: sudo server-report <summary|auth|audit|full>
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+
+usage() {
+    cat <<'EOF'
+Usage: sudo server-report <command>
+
+Commands:
+  summary   Uptime, load, memory, disk, SSH attempts, services, updates
+  auth      Failed/successful logins (48h), sessions, banned IPs
+  audit     Audit events by key (ssh_config, user_db, sudoers, etc.)
+  full      Full logwatch report (today, detail low)
+  version   Print version and exit
+
+All output is plain text (no colors, no control codes).
+EOF
+    exit 0
+}
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+cmd_exists() { command -v "$1" &>/dev/null; }
+
+safe_run() {
+    # Run a command, return output or fallback string
+    local fallback="${1:-(unavailable)}"
+    shift
+    "$@" 2>/dev/null || echo "$fallback"
+}
+
+section() {
+    echo ""
+    echo "--- $1 ---"
+}
+
+# ── summary ──────────────────────────────────────────────────────────────────
+
+cmd_summary() {
+    echo "=== Server Health Summary ==="
+    echo "Generated: $(date -Iseconds)"
+
+    section "System"
+    echo "Hostname:  $(hostname)"
+    echo "Uptime:    $(uptime -p 2>/dev/null || uptime | sed 's/.*up /up /' | sed 's/,.*load.*//')"
+    echo "Load avg:  $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo '(unavailable)')"
+    echo "Kernel:    $(uname -r)"
+
+    section "Memory"
+    if cmd_exists free; then
+        free -h | awk '/^Mem:/ {printf "RAM:       %s used / %s total (%s free)\n", $3, $2, $4}'
+        free -h | awk '/^Swap:/ {printf "Swap:      %s used / %s total\n", $3, $2}'
+    else
+        echo "(free not available)"
+    fi
+
+    section "Disk"
+    df -h / | awk 'NR==2 {printf "Root (/):  %s used / %s total (%s)\n", $3, $2, $5}'
+
+    section "SSH (last 48h)"
+    local failed=0 accepted=0
+    local cutoff
+    cutoff=$(date -d '48 hours ago' '+%b %e' 2>/dev/null || date -d '2 days ago' '+%b %e' 2>/dev/null || echo "")
+    if [[ -n "$cutoff" && -f /var/log/auth.log ]]; then
+        # Filter auth.log to roughly the last 48h by date prefix
+        local recent
+        recent=$(awk -v cutoff="$cutoff" 'BEGIN{found=0} $0 ~ cutoff {found=1} found{print}' /var/log/auth.log 2>/dev/null || true)
+        failed=$(echo "$recent" | grep -c "Failed password\|Failed publickey" || echo 0)
+        accepted=$(echo "$recent" | grep -c "Accepted" || echo 0)
+    elif cmd_exists journalctl; then
+        failed=$(journalctl -u ssh -u sshd --since "48h ago" --no-pager 2>/dev/null | grep -c "Failed password\|Failed publickey" || echo 0)
+        accepted=$(journalctl -u ssh -u sshd --since "48h ago" --no-pager 2>/dev/null | grep -c "Accepted" || echo 0)
+    elif [[ -f /var/log/auth.log ]]; then
+        # No date filtering available, scan whole file
+        failed=$(grep -c "Failed password\|Failed publickey" /var/log/auth.log 2>/dev/null || echo 0)
+        accepted=$(grep -c "Accepted" /var/log/auth.log 2>/dev/null || echo 0)
+    fi
+    echo "Failed:    $failed attempts"
+    echo "Accepted:  $accepted logins"
+
+    section "Fail2ban"
+    if cmd_exists fail2ban-client; then
+        local jails banned
+        jails=$(fail2ban-client status 2>/dev/null | grep "Jail list" | sed 's/.*:\s*//' | tr -d '\t' || echo "(none)")
+        echo "Jails:     $jails"
+        if fail2ban-client status sshd &>/dev/null; then
+            banned=$(fail2ban-client status sshd 2>/dev/null | grep "Currently banned" | awk '{print $NF}')
+            echo "SSH bans:  $banned currently banned"
+        fi
+    else
+        echo "(fail2ban not installed)"
+    fi
+
+    section "Sudo usage (last 48h)"
+    local sudo_count=0
+    if [[ -n "${cutoff:-}" && -f /var/log/auth.log ]]; then
+        sudo_count=$(awk -v cutoff="$cutoff" 'BEGIN{found=0} $0 ~ cutoff {found=1} found{print}' /var/log/auth.log 2>/dev/null | grep -c "sudo:" || echo 0)
+    elif cmd_exists journalctl; then
+        sudo_count=$(journalctl --since "48h ago" --no-pager 2>/dev/null | grep -c "sudo:" || echo 0)
+    elif [[ -f /var/log/auth.log ]]; then
+        sudo_count=$(grep -c "sudo:" /var/log/auth.log 2>/dev/null || echo 0)
+    fi
+    echo "Sudo events: $sudo_count"
+
+    section "Audit"
+    if cmd_exists auditctl; then
+        local rule_count
+        rule_count=$(auditctl -l 2>/dev/null | grep -cv "^No rules" || echo 0)
+        echo "Rules loaded: $rule_count"
+        if cmd_exists aureport; then
+            local auth_events
+            auth_events=$(aureport --auth --summary 2>/dev/null | tail -1 | awk '{print $1}' || echo "0")
+            echo "Auth events: $auth_events (total)"
+        fi
+    else
+        echo "(auditd not installed)"
+    fi
+
+    section "Services"
+    local services=(ssh sshd fail2ban ufw netbird auditd)
+    for svc in "${services[@]}"; do
+        if systemctl list-unit-files "${svc}.service" &>/dev/null 2>&1; then
+            local state
+            state=$(systemctl is-active "${svc}.service" 2>/dev/null || echo "unknown")
+            echo "  ${svc}: ${state}"
+        fi
+    done
+    # Check openclaw gateway (user service)
+    local oc_state
+    oc_state=$(systemctl --user is-active openclaw-gateway.service 2>/dev/null || echo "not found")
+    echo "  openclaw-gateway: ${oc_state}"
+
+    section "Updates"
+    if cmd_exists apt-get; then
+        local updates
+        updates=$(apt-get -s upgrade 2>/dev/null | grep -c "^Inst " || echo 0)
+        echo "Pending:   $updates package(s)"
+        local security
+        security=$(apt-get -s upgrade 2>/dev/null | grep "^Inst " | grep -c "-security" || echo 0)
+        echo "Security:  $security package(s)"
+    else
+        echo "(apt not available)"
+    fi
+
+    echo ""
+    echo "=== End Summary ==="
+}
+
+# ── auth ─────────────────────────────────────────────────────────────────────
+
+cmd_auth() {
+    echo "=== Auth Report (last 48h) ==="
+    echo "Generated: $(date -Iseconds)"
+
+    section "Failed logins"
+    if [[ -f /var/log/auth.log ]]; then
+        grep "Failed password\|Failed publickey" /var/log/auth.log 2>/dev/null \
+            | awk '{print $1, $2, $3, $9, $11}' \
+            | sort | uniq -c | sort -rn \
+            | head -20 || echo "(none)"
+    elif cmd_exists journalctl; then
+        journalctl -u ssh -u sshd --since "48h ago" --no-pager 2>/dev/null \
+            | grep "Failed password\|Failed publickey" \
+            | awk '{print $1, $2, $3, $9, $11}' \
+            | sort | uniq -c | sort -rn \
+            | head -20 || echo "(none)"
+    else
+        echo "(no log source available)"
+    fi
+
+    section "Successful logins"
+    if [[ -f /var/log/auth.log ]]; then
+        grep "Accepted" /var/log/auth.log 2>/dev/null \
+            | awk '{print $1, $2, $3, $9, $11}' \
+            | tail -20 || echo "(none)"
+    elif cmd_exists journalctl; then
+        journalctl -u ssh -u sshd --since "48h ago" --no-pager 2>/dev/null \
+            | grep "Accepted" \
+            | awk '{print $1, $2, $3, $9, $11}' \
+            | tail -20 || echo "(none)"
+    else
+        echo "(no log source available)"
+    fi
+
+    section "Current sessions"
+    who 2>/dev/null || echo "(none)"
+
+    section "Banned IPs (fail2ban)"
+    if cmd_exists fail2ban-client; then
+        if fail2ban-client status sshd &>/dev/null; then
+            local banned_list
+            banned_list=$(fail2ban-client status sshd 2>/dev/null | grep "Banned IP" | sed 's/.*:\s*//')
+            if [[ -n "$banned_list" ]]; then
+                echo "$banned_list"
+            else
+                echo "(none currently banned)"
+            fi
+        else
+            echo "(sshd jail not active)"
+        fi
+    else
+        echo "(fail2ban not installed)"
+    fi
+
+    echo ""
+    echo "=== End Auth Report ==="
+}
+
+# ── audit ────────────────────────────────────────────────────────────────────
+
+cmd_audit() {
+    echo "=== Audit Report ==="
+    echo "Generated: $(date -Iseconds)"
+
+    if ! cmd_exists aureport; then
+        echo "(auditd/aureport not installed — skipping)"
+        echo "=== End Audit Report ==="
+        return 0
+    fi
+
+    section "Events by key (last 24h)"
+    local keys=("ssh_config" "user_db" "sudoers_changes" "firewall_config" "cron_changes" "priv_esc")
+    for key in "${keys[@]}"; do
+        local count
+        count=$(ausearch -k "$key" --start today 2>/dev/null | grep -c "^type=" || echo 0)
+        printf "  %-20s %s event(s)\n" "$key" "$count"
+    done
+
+    section "Authentication summary"
+    aureport --auth --summary 2>/dev/null | tail -5 || echo "(no data)"
+
+    section "Failed syscalls (last 24h)"
+    aureport --failed --summary 2>/dev/null | tail -10 || echo "(no data)"
+
+    section "Anomaly events"
+    aureport --anomaly --summary 2>/dev/null | tail -5 || echo "(no data)"
+
+    echo ""
+    echo "=== End Audit Report ==="
+}
+
+# ── full ─────────────────────────────────────────────────────────────────────
+
+cmd_full() {
+    echo "=== Full Logwatch Report ==="
+    echo "Generated: $(date -Iseconds)"
+
+    if ! cmd_exists logwatch; then
+        echo "(logwatch not installed — falling back to summary)"
+        cmd_summary
+        return 0
+    fi
+
+    logwatch --detail low --range today --output stdout 2>/dev/null \
+        || echo "(logwatch failed — check configuration)"
+
+    echo ""
+    echo "=== End Logwatch Report ==="
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+main() {
+    if [[ $# -eq 0 ]]; then
+        usage
+    fi
+
+    local cmd="$1"
+    case "$cmd" in
+        summary)  cmd_summary ;;
+        auth)     cmd_auth ;;
+        audit)    cmd_audit ;;
+        full)     cmd_full ;;
+        version)  echo "server-report v${VERSION}"; exit 0 ;;
+        -h|--help|help) usage ;;
+        *)
+            echo "Error: unknown command '$cmd'"
+            echo "Run 'server-report --help' for usage."
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
