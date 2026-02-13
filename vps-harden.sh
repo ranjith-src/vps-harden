@@ -530,7 +530,14 @@ F2BEOF
 mod_sysctl() {
     log_header "Module: sysctl"
 
-    local sysctl_conf="/etc/sysctl.d/99-hardening.conf"
+    local sysctl_conf="/etc/sysctl.d/99-zz-hardening.conf"
+
+    # Remove old 99-hardening.conf if it exists (renamed to 99-zz- to sort after 99-sysctl.conf)
+    if [[ -f "/etc/sysctl.d/99-hardening.conf" ]]; then
+        log_info "Removing old 99-hardening.conf (renamed to 99-zz-hardening.conf)"
+        rm -f "/etc/sysctl.d/99-hardening.conf"
+    fi
+
     local desired_sysctl
     desired_sysctl=$(cat <<'SYSEOF'
 # VPS hardening — managed by vps-harden.sh
