@@ -6,6 +6,8 @@
 
 Idempotent VPS security hardening script for Debian/Ubuntu. Run it once on a fresh VPS or repeatedly to verify and fix drift.
 
+> **New here?** Start with the [Getting Started guide](docs/getting-started.md) — it walks you through the full setup in about 10 minutes.
+
 ## Quick Start
 
 **Install:**
@@ -42,6 +44,7 @@ sudo vps-harden --username deploy \
 | `--timezone TZ` | No | System timezone (e.g. `Europe/Amsterdam`, `UTC`) |
 | `--hostname NAME` | No | Set system hostname |
 | `--auto-reboot` | No | Enable automatic reboot after kernel updates |
+| `--openclaw-skill` | No | Add `server-report` skill to an OpenClaw bot (requires OpenClaw installed) |
 | `--skip MOD[,MOD]` | No | Comma-separated modules to skip |
 | `--only MOD[,MOD]` | No | Run only specified modules |
 | `--dry-run` | No | Preview changes without applying them |

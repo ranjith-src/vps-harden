@@ -110,6 +110,7 @@ NETBIRD_KEY=""
 TIMEZONE=""
 SET_HOSTNAME=""
 AUTO_REBOOT="false"
+OPENCLAW_SKILL="false"
 SKIP_MODULES=""
 ONLY_MODULES=""
 DRY_RUN="false"
@@ -169,6 +170,7 @@ Optional:
   --timezone TZ          Set system timezone (e.g. Europe/Amsterdam)
   --hostname NAME        Set hostname
   --auto-reboot          Enable auto-reboot for kernel updates
+  --openclaw-skill       Add server-report skill to OpenClaw bot
   --skip MOD[,MOD]       Comma-separated modules to skip
   --only MOD[,MOD]       Only run specified modules (comma-separated)
   --dry-run              Show what would change, change nothing
@@ -195,6 +197,10 @@ Examples:
   # Dry run:
   sudo vps-harden --username deploy \
     --ssh-key ~/.ssh/authorized_keys --dry-run
+
+  # Add server-report to OpenClaw bot:
+  sudo vps-harden --username deploy \
+    --ssh-key ~/.ssh/authorized_keys --only monitoring --openclaw-skill
 USAGE
     exit 0
 }
@@ -214,6 +220,7 @@ parse_config_file() {
             timezone)       TIMEZONE="$value" ;;
             hostname)       SET_HOSTNAME="$value" ;;
             auto_reboot)    AUTO_REBOOT="$value" ;;
+            openclaw_skill) OPENCLAW_SKILL="$value" ;;
             skip)           SKIP_MODULES="$value" ;;
             only)           ONLY_MODULES="$value" ;;
         esac
@@ -230,6 +237,7 @@ parse_args() {
             --timezone)       TIMEZONE="$2"; shift 2 ;;
             --hostname)       SET_HOSTNAME="$2"; shift 2 ;;
             --auto-reboot)    AUTO_REBOOT="true"; shift ;;
+            --openclaw-skill) OPENCLAW_SKILL="true"; shift ;;
             --skip)           SKIP_MODULES="$2"; shift 2 ;;
             --only)           ONLY_MODULES="$2"; shift 2 ;;
             --dry-run)        DRY_RUN="true"; shift ;;
@@ -934,6 +942,145 @@ LWEOF
                 log_fail "Sudoers file failed validation — removing"
                 rm -f "$sudoers_file"
             fi
+        fi
+    fi
+
+    # ── OpenClaw skill (optional) ────────────────────────────────────────
+    if [[ "$OPENCLAW_SKILL" == "true" ]]; then
+        setup_openclaw_skill
+    fi
+}
+
+# ── OpenClaw skill setup ────────────────────────────────────────────────────
+setup_openclaw_skill() {
+    log_header "OpenClaw: server-report skill"
+
+    local user_home="/home/${USERNAME}"
+    local oc_config="${user_home}/.openclaw/openclaw.json"
+
+    if [[ ! -f "$oc_config" ]]; then
+        log_warn "OpenClaw config not found at $oc_config — skipping skill setup"
+        return 0
+    fi
+
+    # ── Add server-report to safeBins ────────────────────────────────────
+    if jq -e '.tools.exec.safeBins | index("server-report")' "$oc_config" &>/dev/null; then
+        log_info "server-report already in safeBins"
+    else
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_dry "Add server-report to safeBins in $oc_config"
+        else
+            local tmp_config
+            tmp_config=$(mktemp)
+            if jq '.tools.exec.safeBins += ["server-report"]' "$oc_config" > "$tmp_config" 2>/dev/null; then
+                mv "$tmp_config" "$oc_config"
+                chown "${USERNAME}:${USERNAME}" "$oc_config"
+                chmod 600 "$oc_config"
+                log_info "Added server-report to safeBins"
+            else
+                rm -f "$tmp_config"
+                log_warn "Failed to update safeBins — edit $oc_config manually"
+            fi
+        fi
+    fi
+
+    # ── Create skill SKILL.md ────────────────────────────────────────────
+    local skill_dir="${user_home}/.openclaw/workspace/skills/server-report"
+    local skill_file="${skill_dir}/SKILL.md"
+
+    if [[ -f "$skill_file" ]]; then
+        log_info "server-report skill already exists"
+    else
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_dry "Create skill at $skill_file"
+        else
+            mkdir -p "$skill_dir"
+            cat > "$skill_file" <<'SKILLEOF'
+# server-report — VPS Health Monitoring
+
+You have access to the `server-report` tool for checking VPS health.
+
+## Usage
+
+```bash
+sudo server-report <command>
+```
+
+## Commands
+
+| Command | Use when | Output size |
+|---------|----------|-------------|
+| `summary` | "How's the server?", general health check | Short — send directly |
+| `auth` | "Any attacks?", "Who logged in?", SSH/login questions | Medium — summarize key findings |
+| `audit` | "Any config changes?", "Check audit logs" | Medium — summarize by key |
+| `full` | "Full report", "Run logwatch" | Long — always summarize, highlight important items only |
+
+## Decision Guide
+
+- **Default / general questions** -> `summary`
+- **Security / attack / login questions** -> `auth`
+- **Config changes / audit trail** -> `audit`
+- **Comprehensive / "everything"** -> `full`
+
+## Output Rules
+
+- `summary` output is compact — send it directly in the chat message as-is
+- For `auth`, `audit`, and `full` — read the output, then write a concise summary highlighting:
+  - Anything unusual or concerning
+  - Key numbers (failed logins, banned IPs, rule violations)
+  - Overall status (normal / needs attention / urgent)
+- Never send raw `full` output — it's too long for chat
+
+## Examples
+
+User: "how's the server doing?"
+-> Run `sudo server-report summary`, send the output directly
+
+User: "anyone trying to break in?"
+-> Run `sudo server-report auth`, summarize: "In the last 48h: X failed login attempts from Y unique IPs. Z IPs currently banned by fail2ban. No successful unauthorized logins."
+
+User: "any suspicious changes?"
+-> Run `sudo server-report audit`, summarize by key
+SKILLEOF
+            chown -R "${USERNAME}:${USERNAME}" "$skill_dir"
+            log_info "Created skill at $skill_file"
+        fi
+    fi
+
+    # ── Add to TOOLS.md ──────────────────────────────────────────────────
+    local tools_md="${user_home}/.openclaw/workspace/TOOLS.md"
+
+    if [[ -f "$tools_md" ]] && grep -q "server-report" "$tools_md" 2>/dev/null; then
+        log_info "server-report already documented in TOOLS.md"
+    elif [[ -f "$tools_md" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_dry "Append server-report section to $tools_md"
+        else
+            cat >> "$tools_md" <<'TOOLSEOF'
+
+## Server Monitoring
+- **server-report** — VPS health reports via `sudo server-report <command>`
+- Subcommands: `summary` (quick health), `auth` (logins/bans), `audit` (audit events), `full` (logwatch)
+- Runs via sudo NOPASSWD — no password prompt needed
+- See `skills/server-report/SKILL.md` for decision guide on which subcommand to use
+TOOLSEOF
+            chown "${USERNAME}:${USERNAME}" "$tools_md"
+            log_info "Added server-report section to TOOLS.md"
+        fi
+    else
+        log_warn "TOOLS.md not found at $tools_md — skipping"
+    fi
+
+    # ── Restart gateway ──────────────────────────────────────────────────
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dry "Restart openclaw-gateway service"
+    else
+        local uid
+        uid=$(id -u "$USERNAME")
+        if sudo -u "$USERNAME" XDG_RUNTIME_DIR="/run/user/${uid}" systemctl --user restart openclaw-gateway 2>/dev/null; then
+            log_info "Restarted openclaw-gateway"
+        else
+            log_warn "Could not restart openclaw-gateway — restart it manually: systemctl --user restart openclaw-gateway"
         fi
     fi
 }
