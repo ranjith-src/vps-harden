@@ -57,6 +57,24 @@ log_dry()   { echo -e "${CYAN}[DRY]${NC} Would: $1"; log_raw "[DRY] $1"; }
 
 die() { log_fail "$1"; exit 1; }
 
+# ── Detect SSH client IP ─────────────────────────────────────────────────
+detect_ssh_client_ip() {
+    local ip=""
+    # Method 1: SSH_CLIENT env var (often stripped by sudo env_reset)
+    if [[ -n "${SSH_CLIENT:-}" ]]; then
+        ip=$(echo "$SSH_CLIENT" | awk '{print $1}')
+    fi
+    # Method 2: who am i (works through sudo on most systems)
+    if [[ -z "$ip" ]]; then
+        ip=$(who am i 2>/dev/null | grep -oE '\(([0-9]{1,3}\.){3}[0-9]{1,3}\)' | tr -d '()' || true)
+    fi
+    # Method 3: ss — query kernel socket table for established SSH connections
+    if [[ -z "$ip" ]]; then
+        ip=$(ss -tnp 2>/dev/null | grep ":22 " | grep "ESTAB" | awk '{print $5}' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1 || true)
+    fi
+    echo "$ip"
+}
+
 # ── Trap handler ─────────────────────────────────────────────────────────────
 cleanup() {
     local exit_code=$?
@@ -114,7 +132,9 @@ OPENCLAW_SKILL="false"
 SKIP_MODULES=""
 ONLY_MODULES=""
 DRY_RUN="false"
+INTERACTIVE="false"
 CONFIG_FILE=""
+SSH_KEY_CONTENT=""
 
 # ── Distro detection ────────────────────────────────────────────────────────
 check_distro() {
@@ -158,13 +178,18 @@ detect_ssh_service() {
 # ── Argument parsing ────────────────────────────────────────────────────────
 usage() {
     cat <<'USAGE'
-Usage: sudo vps-harden --username USER --ssh-key KEY [options]
+Usage: sudo vps-harden [options]
+       sudo vps-harden --username USER --ssh-key KEY [options]
 
-Required:
+If run without --username and --ssh-key, an interactive setup wizard
+guides you through each step with auto-detection and sensible defaults.
+
+Required (or use interactive wizard):
   --username USER        Non-root user to create/harden
   --ssh-key KEY          SSH public key (file path or inline string)
 
 Optional:
+  --interactive          Force interactive setup wizard
   --ssh-safety-ip IP     IP to always allow SSH from (safety net)
   --netbird-key KEY      Netbird setup key (skip VPN if omitted)
   --timezone TZ          Set system timezone (e.g. Europe/Amsterdam)
@@ -185,6 +210,9 @@ Modules (execution order):
   sops upgrades monitoring shell misc verify
 
 Examples:
+  # Interactive wizard (recommended for first run):
+  sudo ./vps-harden.sh
+
   # New VPS:
   sudo vps-harden --username deploy \
     --ssh-key "ssh-ed25519 AAAA..." --netbird-key "nbs-XXXX" \
@@ -240,6 +268,7 @@ parse_args() {
             --openclaw-skill) OPENCLAW_SKILL="true"; shift ;;
             --skip)           SKIP_MODULES="$2"; shift 2 ;;
             --only)           ONLY_MODULES="$2"; shift 2 ;;
+            --interactive)    INTERACTIVE="true"; shift ;;
             --dry-run)        DRY_RUN="true"; shift ;;
             --config)         CONFIG_FILE="$2"; shift 2 ;;
             --no-color)       USE_COLOR="false"; shift ;;
@@ -257,10 +286,13 @@ validate_args() {
     [[ -n "$SSH_KEY" ]] || die "--ssh-key is required"
 
     # Resolve SSH key — could be a file path or inline key
-    if [[ -f "$SSH_KEY" ]]; then
-        SSH_KEY_CONTENT=$(cat "$SSH_KEY")
-    else
-        SSH_KEY_CONTENT="$SSH_KEY"
+    # Skip if the wizard already resolved SSH_KEY_CONTENT
+    if [[ -z "$SSH_KEY_CONTENT" ]]; then
+        if [[ -f "$SSH_KEY" ]]; then
+            SSH_KEY_CONTENT=$(cat "$SSH_KEY")
+        else
+            SSH_KEY_CONTENT="$SSH_KEY"
+        fi
     fi
     [[ "$SSH_KEY_CONTENT" =~ ^ssh- ]] || die "--ssh-key must be a file with SSH keys or an inline ssh-* public key"
 }
@@ -1425,11 +1457,307 @@ check_ssh_setting() {
     fi
 }
 
+# ── Interactive Setup Wizard ──────────────────────────────────────────────────
+interactive_setup() {
+    # Require a TTY for interactive mode
+    if [[ ! -t 0 ]]; then
+        die "Interactive mode requires a terminal (stdin is not a TTY)"
+    fi
+
+    setup_colors
+
+    echo -e "${BOLD}${CYAN}"
+    echo "  ╦  ╦╔═╗╔═╗  ╦ ╦╔═╗╦═╗╔╦╗╔═╗╔╗╔"
+    echo "  ╚╗╔╝╠═╝╚═╗  ╠═╣╠═╣╠╦╝ ║║║╣ ║║║"
+    echo "   ╚╝ ╩  ╚═╝  ╩ ╩╩ ╩╩╚══╩╝╚═╝╝╚╝  Setup Wizard"
+    echo -e "${NC}"
+
+    local wiz_key_source=""
+
+    # ── Step 1: Username ─────────────────────────────────────────────────
+    echo -e "${BOLD}1. Username${NC}"
+    echo "   The non-root user to create (or harden if it exists)."
+    echo "   This user gets sudo access and SSH login."
+    local default_user="${USERNAME:-}"
+    if [[ -z "$default_user" ]] && [[ -n "${SUDO_USER:-}" ]] && [[ "$SUDO_USER" != "root" ]]; then
+        default_user="$SUDO_USER"
+    fi
+    if [[ -z "$default_user" ]]; then
+        default_user="deploy"
+    fi
+    printf "   Username [%s]: " "$default_user"
+    read -r input
+    USERNAME="${input:-$default_user}"
+    echo ""
+
+    # ── Step 2: SSH Public Key ───────────────────────────────────────────
+    echo -e "${BOLD}2. SSH Public Key${NC}"
+    echo "   Your public key for passwordless SSH login."
+    echo "   Without this, you'll be locked out when password auth is disabled."
+
+    if [[ -z "$SSH_KEY_CONTENT" ]]; then
+        # Try to auto-detect from authorized_keys
+        local detected_key=""
+        local key_file=""
+        for candidate in "/root/.ssh/authorized_keys" "/home/${USERNAME}/.ssh/authorized_keys"; do
+            if [[ -f "$candidate" ]]; then
+                detected_key=$(grep -m1 "^ssh-" "$candidate" 2>/dev/null || true)
+                if [[ -n "$detected_key" ]]; then
+                    key_file="$candidate"
+                    break
+                fi
+            fi
+        done
+
+        if [[ -n "$detected_key" ]]; then
+            local key_type key_comment
+            key_type=$(echo "$detected_key" | awk '{print $1}')
+            key_comment=$(echo "$detected_key" | awk '{print $3}')
+            echo ""
+            echo "   Detected key from ${key_file}:"
+            echo -e "   ${CYAN}${key_type} ...${key_comment:+$key_comment}${NC}"
+            printf "   Use this key? [Y/n]: "
+            read -r input
+            if [[ -z "$input" || "$input" =~ ^[Yy] ]]; then
+                SSH_KEY="$key_file"
+                SSH_KEY_CONTENT=$(grep "^ssh-" "$key_file")
+                wiz_key_source="auto-detected from $key_file"
+            else
+                detected_key=""
+            fi
+        fi
+
+        if [[ -z "$detected_key" ]] && [[ -z "$SSH_KEY_CONTENT" ]]; then
+            echo ""
+            echo "   No SSH key found on this server."
+            echo ""
+            echo "   How would you like to provide your public key?"
+            echo "     1) GitHub — fetch your key from GitHub (easiest)"
+            echo "     2) ssh-copy-id — copy it from your local machine"
+            echo "     3) Paste — paste the key string directly"
+            echo ""
+            printf "   Choice [1]: "
+            read -r choice
+            choice="${choice:-1}"
+
+            case "$choice" in
+                1)
+                    # GitHub fetch
+                    printf "   GitHub username: "
+                    read -r gh_user
+                    if [[ -z "$gh_user" ]]; then
+                        die "GitHub username cannot be empty"
+                    fi
+                    echo "   Fetching keys from github.com/${gh_user}..."
+                    local gh_keys
+                    gh_keys=$(curl -fsSL "https://github.com/${gh_user}.keys" 2>/dev/null || true)
+                    if [[ -z "$gh_keys" ]]; then
+                        die "No SSH keys found for GitHub user '${gh_user}'. Check the username and try again."
+                    fi
+                    local gh_key_count
+                    gh_key_count=$(echo "$gh_keys" | grep -c "^ssh-" || true)
+                    echo "   Found ${gh_key_count} key(s):"
+                    echo "$gh_keys" | while IFS= read -r k; do
+                        local kt kfp
+                        kt=$(echo "$k" | awk '{print $1}')
+                        kfp=$(echo "$k" | awk '{print substr($2,length($2)-7)}')
+                        echo -e "     ${CYAN}${kt} ...${kfp}${NC}"
+                    done
+                    printf "   Use these keys? [Y/n]: "
+                    read -r input
+                    if [[ -z "$input" || "$input" =~ ^[Yy] ]]; then
+                        SSH_KEY_CONTENT="$gh_keys"
+                        wiz_key_source="fetched from github.com/${gh_user}"
+                    else
+                        die "Aborted. Re-run the wizard to try another method."
+                    fi
+                    ;;
+                2)
+                    # ssh-copy-id
+                    echo ""
+                    echo "   On your LOCAL machine, open a new terminal and run:"
+                    echo -e "     ${BOLD}ssh-copy-id root@$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'YOUR_VPS_IP')${NC}"
+                    echo ""
+                    printf "   Press Enter here when done..."
+                    read -r
+                    # Re-check for keys
+                    local copied_key=""
+                    for candidate in "/root/.ssh/authorized_keys" "/home/${USERNAME}/.ssh/authorized_keys"; do
+                        if [[ -f "$candidate" ]]; then
+                            copied_key=$(grep -m1 "^ssh-" "$candidate" 2>/dev/null || true)
+                            if [[ -n "$copied_key" ]]; then
+                                key_file="$candidate"
+                                break
+                            fi
+                        fi
+                    done
+                    if [[ -z "$copied_key" ]]; then
+                        die "Still no SSH key found. Make sure ssh-copy-id succeeded and try again."
+                    fi
+                    SSH_KEY="$key_file"
+                    SSH_KEY_CONTENT=$(grep "^ssh-" "$key_file")
+                    wiz_key_source="copied via ssh-copy-id"
+                    local kt2 kc2
+                    kt2=$(echo "$copied_key" | awk '{print $1}')
+                    kc2=$(echo "$copied_key" | awk '{print $3}')
+                    echo -e "   Found: ${CYAN}${kt2} ...${kc2:+$kc2}${NC}"
+                    ;;
+                3)
+                    # Manual paste
+                    echo ""
+                    echo "   On your local machine, run:"
+                    echo -e "     ${BOLD}cat ~/.ssh/id_ed25519.pub${NC}"
+                    echo "   Then paste the output here."
+                    echo ""
+                    printf "   SSH public key: "
+                    read -r pasted_key
+                    if [[ ! "$pasted_key" =~ ^ssh- ]]; then
+                        die "That doesn't look like an SSH public key (must start with ssh-). Try again."
+                    fi
+                    SSH_KEY_CONTENT="$pasted_key"
+                    wiz_key_source="pasted manually"
+                    ;;
+                *)
+                    die "Invalid choice: $choice"
+                    ;;
+            esac
+        fi
+    fi
+    echo ""
+
+    # ── Step 3: Safety IP ────────────────────────────────────────────────
+    echo -e "${BOLD}3. SSH Safety IP${NC}"
+    echo "   A fallback IP that can always reach SSH port 22, even if the"
+    echo "   VPN tunnel goes down. Usually your current public IP."
+    local detected_ip
+    detected_ip=$(detect_ssh_client_ip)
+    local default_ip="${SSH_SAFETY_IP:-$detected_ip}"
+    if [[ -n "$default_ip" ]]; then
+        echo -e "   Detected your IP: ${CYAN}${default_ip}${NC}"
+        printf "   Safety IP [%s] (or 'skip'): " "$default_ip"
+    else
+        printf "   Safety IP (or 'skip'): "
+    fi
+    read -r input
+    if [[ "$input" == "skip" ]]; then
+        SSH_SAFETY_IP=""
+    else
+        SSH_SAFETY_IP="${input:-$default_ip}"
+    fi
+    echo ""
+
+    # ── Step 4: Timezone ─────────────────────────────────────────────────
+    echo -e "${BOLD}4. Timezone${NC}"
+    echo "   System timezone for logs and cron jobs."
+    local detected_tz
+    detected_tz=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo "UTC")
+    local default_tz="${TIMEZONE:-$detected_tz}"
+    printf "   Timezone [%s] (or 'skip'): " "$default_tz"
+    read -r input
+    if [[ "$input" == "skip" ]]; then
+        TIMEZONE=""
+    else
+        TIMEZONE="${input:-$default_tz}"
+    fi
+    echo ""
+
+    # ── Step 5: Netbird Key ──────────────────────────────────────────────
+    echo -e "${BOLD}5. Netbird VPN Setup Key (optional)${NC}"
+    echo "   Connects this server to your Netbird mesh network."
+    echo "   Get a setup key from app.netbird.io → Setup Keys."
+    local default_nb="${NETBIRD_KEY:-}"
+    if [[ -n "$default_nb" ]]; then
+        printf "   Netbird setup key [%s...]: " "${default_nb:0:8}"
+    else
+        printf "   Netbird setup key (Enter to skip): "
+    fi
+    read -r input
+    NETBIRD_KEY="${input:-$default_nb}"
+    echo ""
+
+    # ── Step 6: Dry Run ──────────────────────────────────────────────────
+    echo -e "${BOLD}6. Dry Run?${NC}"
+    echo "   A dry run shows what would change without making changes."
+    echo "   Recommended for the first run."
+    printf "   Start with dry run? [Y/n]: "
+    read -r input
+    if [[ -z "$input" || "$input" =~ ^[Yy] ]]; then
+        DRY_RUN="true"
+    else
+        DRY_RUN="false"
+    fi
+    echo ""
+
+    # ── Summary ──────────────────────────────────────────────────────────
+    local key_display
+    if [[ -n "$SSH_KEY_CONTENT" ]]; then
+        local first_key
+        first_key=$(echo "$SSH_KEY_CONTENT" | head -1)
+        local kt3 kc3
+        kt3=$(echo "$first_key" | awk '{print $1}')
+        kc3=$(echo "$first_key" | awk '{print $3}')
+        key_display="${kt3} ...${kc3:+$kc3}"
+        if [[ -n "$wiz_key_source" ]]; then
+            key_display="${key_display} (${wiz_key_source})"
+        fi
+    elif [[ -n "$SSH_KEY" ]]; then
+        key_display="$SSH_KEY"
+    fi
+
+    echo -e "${BOLD}── Summary ──────────────────────────────────────────${NC}"
+    printf "   Username:     %s\n" "$USERNAME"
+    printf "   SSH key:      %s\n" "$key_display"
+    printf "   Safety IP:    %s\n" "${SSH_SAFETY_IP:-<skipped>}"
+    printf "   Timezone:     %s\n" "${TIMEZONE:-<skipped>}"
+    printf "   Netbird:      %s\n" "${NETBIRD_KEY:+${NETBIRD_KEY:0:8}...}"
+    [[ -z "$NETBIRD_KEY" ]] && printf "   Netbird:      %s\n" "<skipped>"
+    printf "   Dry run:      %s\n" "$DRY_RUN"
+    echo ""
+
+    # Build equivalent CLI command
+    local cli_cmd="sudo ./vps-harden.sh --username ${USERNAME}"
+    if [[ -n "$SSH_KEY" ]]; then
+        cli_cmd+=" --ssh-key ${SSH_KEY}"
+    elif [[ -n "$SSH_KEY_CONTENT" ]]; then
+        # Use first key inline (truncated for display)
+        cli_cmd+=" --ssh-key \"$(echo "$SSH_KEY_CONTENT" | head -1)\""
+    fi
+    [[ -n "$SSH_SAFETY_IP" ]] && cli_cmd+=" --ssh-safety-ip ${SSH_SAFETY_IP}"
+    [[ -n "$TIMEZONE" ]] && cli_cmd+=" --timezone ${TIMEZONE}"
+    [[ -n "$NETBIRD_KEY" ]] && cli_cmd+=" --netbird-key ${NETBIRD_KEY}"
+    [[ "$DRY_RUN" == "true" ]] && cli_cmd+=" --dry-run"
+
+    echo "   For future runs:"
+    echo -e "   ${CYAN}${cli_cmd}${NC}"
+    echo ""
+
+    printf "   Proceed? [Y/n]: "
+    read -r input
+    if [[ -n "$input" && ! "$input" =~ ^[Yy] ]]; then
+        echo "   Aborted."
+        exit 0
+    fi
+    echo ""
+
+    # If we got SSH_KEY_CONTENT but no SSH_KEY, set a sentinel so validate_args
+    # knows we already resolved the key
+    if [[ -n "$SSH_KEY_CONTENT" && -z "$SSH_KEY" ]]; then
+        SSH_KEY="<wizard>"
+    fi
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 main() {
     parse_args "$@"
     setup_colors
     [[ -n "$CONFIG_FILE" ]] && parse_config_file "$CONFIG_FILE"
+
+    # Launch interactive wizard if --interactive, or if no required params and no config file
+    if [[ "$INTERACTIVE" == "true" ]] || \
+       { [[ -z "$USERNAME" ]] && [[ -z "$SSH_KEY" ]] && [[ -z "$CONFIG_FILE" ]]; }; then
+        interactive_setup
+    fi
+
     validate_args
     check_distro
     log_init
