@@ -1,0 +1,45 @@
+name: Feature Request
+description: Suggest a new module, parameter, or improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea for vps-harden? We'd love to hear it.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What would you like to see?
+      description: Describe the feature or improvement. What problem does it solve?
+      placeholder: "It would be useful if vps-harden could also configure DNS-over-TLS, because..."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: type
+    attributes:
+      label: Type of change
+      options:
+        - New hardening module
+        - New parameter/flag
+        - Improvement to existing module
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: implementation
+    attributes:
+      label: Suggested implementation
+      description: If you have an idea of how this could work, share it. Config files to write, packages to install, commands to run, etc.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: willingness
+    attributes:
+      label: Would you be willing to submit a PR for this?
+      options:
+        - label: I'd be happy to implement this myself

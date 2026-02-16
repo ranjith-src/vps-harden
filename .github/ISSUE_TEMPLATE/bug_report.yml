@@ -1,0 +1,77 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please fill in the details below so we can reproduce and fix it.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug. What did you expect to happen vs what actually happened?
+      placeholder: "When I ran vps-harden with --only ssh, it failed with..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command you ran
+      description: The exact command (redact any sensitive values like SSH keys or IPs).
+      render: bash
+      placeholder: "sudo vps-harden --username deploy --ssh-key ~/.ssh/id_ed25519.pub --only ssh"
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Output / error message
+      description: Paste the relevant output or error. Use `--verbose` for detailed output.
+      render: text
+    validations:
+      required: false
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Ubuntu 24.04
+        - Ubuntu 22.04
+        - Ubuntu 20.04
+        - Debian 12 (Bookworm)
+        - Debian 11 (Bullseye)
+        - Other (specify below)
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: vps-harden version
+      description: "Run: vps-harden --version"
+      placeholder: "1.2.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: run-mode
+    attributes:
+      label: Was this a dry run or live run?
+      options:
+        - Live run (applied changes)
+        - Dry run (--dry-run)
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Anything else that might help — VPS provider, architecture (amd64/arm64), whether this is a fresh server or re-run, etc.
+    validations:
+      required: false
