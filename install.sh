@@ -40,6 +40,28 @@ fi
 
 chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
 
+# Also download server-report companion script
+SR_NAME="server-report"
+SR_DOWNLOADED=false
+
+if [[ -n "$LATEST_TAG" ]]; then
+    SR_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${SR_NAME}"
+    if curl -fsSL "$SR_URL" -o "${INSTALL_DIR}/${SR_NAME}" 2>/dev/null; then
+        SR_DOWNLOADED=true
+    fi
+fi
+
+if [[ "$SR_DOWNLOADED" != "true" ]]; then
+    if curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/${SR_NAME}" -o "${INSTALL_DIR}/${SR_NAME}" 2>/dev/null; then
+        SR_DOWNLOADED=true
+    fi
+fi
+
+if [[ "$SR_DOWNLOADED" == "true" ]]; then
+    chmod +x "${INSTALL_DIR}/${SR_NAME}"
+    echo "Installed ${SR_NAME} to ${INSTALL_DIR}/${SR_NAME}"
+fi
+
 echo ""
 echo "Installed ${BINARY_NAME} to ${INSTALL_DIR}/${BINARY_NAME}"
 echo ""
