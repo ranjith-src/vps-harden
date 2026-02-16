@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly SCRIPT_VERSION="1.3.0"
+readonly SCRIPT_VERSION="1.3.4"
 LOG_FILE="/var/log/vps-harden-$(date +%Y%m%d-%H%M%S).log"
 readonly LOG_FILE
 readonly ALL_MODULES="prereqs user ssh firewall fail2ban sysctl netbird firewall_tighten sops upgrades monitoring shell misc verify"
@@ -453,6 +453,7 @@ AllowUsers ${USERNAME}
 X11Forwarding no
 ClientAliveInterval 300
 ClientAliveCountMax 3
+PasswordAuthentication no
 PermitEmptyPasswords no
 MaxSessions 3
 LoginGraceTime 30
@@ -1237,7 +1238,9 @@ mod_verify() {
     log_header "Module: verify — Security Scorecard"
 
     # SSH checks
+    sc_add "SECTION" "SSH Hardening — Locks down remote access"
     check_ssh_setting "PermitRootLogin" "no"
+    check_ssh_setting "PasswordAuthentication" "no"
     check_ssh_setting "MaxAuthTries" "3"
     check_ssh_setting "X11Forwarding" "no"
     check_ssh_setting "PermitEmptyPasswords" "no"
@@ -1271,6 +1274,7 @@ mod_verify() {
     fi
 
     # Firewall
+    sc_add "SECTION" "Firewall — Controls network traffic"
     if command -v ufw &>/dev/null && ufw status | grep -q "^Status: active"; then
         sc_add "PASS" "UFW active, default deny"
     else
@@ -1285,6 +1289,7 @@ mod_verify() {
     fi
 
     # fail2ban
+    sc_add "SECTION" "Intrusion Prevention — Blocks brute-force attacks"
     if command -v fail2ban-client &>/dev/null; then
         if fail2ban-client status sshd &>/dev/null; then
             sc_add "PASS" "fail2ban sshd jail active"
@@ -1296,6 +1301,7 @@ mod_verify() {
     fi
 
     # Kernel hardening
+    sc_add "SECTION" "Kernel Hardening — Prevents network-level attacks"
     local syncookies
     syncookies=$(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null || echo "0")
     if [[ "$syncookies" == "1" ]]; then
@@ -1329,6 +1335,7 @@ mod_verify() {
     fi
 
     # Auditd
+    sc_add "SECTION" "Monitoring — Tracks system activity and threats"
     if command -v auditctl &>/dev/null; then
         if systemctl is-active auditd &>/dev/null; then
             sc_add "PASS" "auditd active"
@@ -1361,6 +1368,7 @@ mod_verify() {
     fi
 
     # Netbird
+    sc_add "SECTION" "Network — Secure mesh VPN tunnel"
     if command -v netbird &>/dev/null; then
         if ip link show wt0 &>/dev/null; then
             sc_add "PASS" "Netbird connected, wt0 up"
@@ -1372,6 +1380,7 @@ mod_verify() {
     fi
 
     # SOPS + age
+    sc_add "SECTION" "Secrets — Encrypted credential management"
     if command -v sops &>/dev/null && command -v age &>/dev/null; then
         sc_add "PASS" "SOPS + age installed"
     else
@@ -1379,6 +1388,7 @@ mod_verify() {
     fi
 
     # Unattended upgrades
+    sc_add "SECTION" "System — OS-level security hygiene"
     if dpkg -l unattended-upgrades 2>/dev/null | grep -q "^ii"; then
         sc_add "PASS" "Unattended upgrades enabled"
     else
@@ -1426,10 +1436,20 @@ mod_verify() {
     fi
     echo ""
 
+    local first_section=true
     for i in "${!SC_LABELS[@]}"; do
         local result="${SC_RESULTS[$i]}"
         local label="${SC_LABELS[$i]}"
         local hint="${SC_HINTS[$i]}"
+        if [[ "$result" == "SECTION" ]]; then
+            if [[ "$first_section" == "true" ]]; then
+                first_section=false
+            else
+                echo ""
+            fi
+            echo -e "  ${BOLD}${CYAN}── ${label} ──${NC}"
+            continue
+        fi
         local color
         case "$result" in
             PASS) color="$GREEN" ;;
@@ -1451,13 +1471,44 @@ mod_verify() {
 
     log_raw "SCORECARD: $SC_PASS PASS | $SC_WARN WARN | $SC_FAIL FAIL"
 
-    if [[ $SC_FAIL -gt 0 ]]; then
-        if [[ "$DRY_RUN" == "true" ]]; then
-            echo -e "  ${CYAN}Items marked \"← will fix\" will be resolved when you run for real.${NC}"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        if [[ $SC_WARN -gt 0 || $SC_FAIL -gt 0 ]]; then
+            echo -e "  ${CYAN}Items marked with ← will be resolved when you run for real.${NC}"
             echo ""
-        else
-            log_warn "There are $SC_FAIL FAILED checks — review and fix them"
         fi
+    else
+        # Next steps (real run only)
+        local has_netbird_warn=false
+        for i in "${!SC_LABELS[@]}"; do
+            if [[ "${SC_RESULTS[$i]}" != "PASS" && "${SC_RESULTS[$i]}" != "SECTION" && "${SC_LABELS[$i]}" == *"Netbird"* ]]; then
+                has_netbird_warn=true; break
+            fi
+        done
+
+        local server_ip
+        server_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_SERVER_IP")
+
+        echo -e "  ${BOLD}NEXT STEPS:${NC}"
+        echo ""
+        echo -e "  ${YELLOW}⚠  IMPORTANT — Verify SSH access before closing this session!${NC}"
+        echo "     Password auth is now disabled. Open a NEW terminal and run:"
+        echo -e "       ${CYAN}ssh ${USERNAME}@${server_ip}${NC}"
+        echo "     If you can log in, you're all set. If not, DON'T close this session."
+
+        if [[ "$has_netbird_warn" == "true" ]]; then
+            echo ""
+            echo "  • Set up Netbird VPN for secure access (replaces open SSH):"
+            echo "    Get a setup key from https://app.netbird.io → Setup Keys, then re-run:"
+            local rerun_cmd
+            rerun_cmd=$(build_rerun_cmd "false")
+            echo -e "      ${CYAN}${rerun_cmd} --netbird-key YOUR_KEY${NC}"
+        fi
+
+        if [[ $SC_WARN -eq 0 && $SC_FAIL -eq 0 ]]; then
+            echo ""
+            echo -e "  ${GREEN}Your server is fully hardened.${NC}"
+        fi
+        echo ""
     fi
 }
 
