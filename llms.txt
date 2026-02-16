@@ -1,0 +1,44 @@
+# VPS-Harden
+
+> Idempotent Bash script to harden a Debian/Ubuntu VPS. One script, zero dependencies, dry-run first, lockout protection built in.
+
+VPS-Harden is a single Bash script that secures a fresh or existing Debian/Ubuntu server. It runs 14 modules covering SSH hardening, firewall (UFW), fail2ban, kernel sysctl hardening, Netbird mesh VPN, SOPS+age secrets management, auditd monitoring, unattended upgrades, and more.
+
+Key properties:
+- Idempotent: checks current state before every action, safe to re-run anytime
+- Dry-run mode: preview every change before applying
+- Lockout protection: validates sshd config, SSH keys, AllowUsers, and firewall rules before restarting — auto-rolls back on failure
+- Interactive wizard: run `sudo vps-harden` with no args for guided setup with auto-detection
+- Security scorecard: grouped verification output with section headers and next-steps guidance
+- Zero dependencies: single Bash file, no Python, no Ansible, no agents
+
+Install: `curl -fsSL https://raw.githubusercontent.com/ranjith-src/vps-harden/main/install.sh | bash`
+
+## Documentation
+
+- [README](https://github.com/ranjith-src/vps-harden/blob/main/README.md): Full parameter reference, module table, scorecard example, config file format
+- [Getting Started Guide](https://github.com/ranjith-src/vps-harden/blob/main/docs/getting-started.md): Step-by-step onboarding from first SSH login to fully verified setup
+- [Contributing](https://github.com/ranjith-src/vps-harden/blob/main/CONTRIBUTING.md): How to add modules, code style, ShellCheck requirements
+- [Releases](https://github.com/ranjith-src/vps-harden/releases): Changelog for each version
+
+## Modules
+
+- prereqs: Installs foundation packages (curl, wget, jq, htop, ufw, fail2ban)
+- user: Creates non-root user with sudo access, deploys SSH keys
+- ssh: Disables root login, disables password auth, MaxAuthTries 3, AllowUsers, banner
+- firewall: UFW default-deny incoming, allow outgoing, allow SSH
+- fail2ban: 3 retries, 3h ban, UFW integration
+- sysctl: SYN cookies, disable ICMP redirects/source routing, martian logging, RP filtering
+- netbird: Installs Netbird mesh VPN, connects with setup key
+- firewall_tighten: Allows VPN tunnel traffic, restricts SSH to safety IP, removes broad rules
+- sops: Installs SOPS + age, generates encryption keypair
+- upgrades: Enables unattended-upgrades, optional auto-reboot
+- monitoring: Installs auditd + logwatch, deploys audit rules, installs server-report CLI
+- shell: umask 027, bash history with timestamps, plaintext secret scanning
+- misc: Timezone, hostname, lock root password, restrict su
+- verify: Runs all checks, prints grouped security scorecard with next steps
+
+## Optional
+
+- [server-report](https://github.com/ranjith-src/vps-harden/blob/main/server-report): Companion CLI for quick VPS health checks (summary, auth, audit, full subcommands)
+- [Config example](https://github.com/ranjith-src/vps-harden/blob/main/examples/config.env): Sample KEY=VALUE config file for repeatable setups
