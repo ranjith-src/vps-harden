@@ -26,12 +26,14 @@ setup_colors() {
 # ── Scorecard tracking ──────────────────────────────────────────────────────
 declare -a SC_LABELS=()
 declare -a SC_RESULTS=()
+declare -a SC_HINTS=()
 SC_PASS=0; SC_WARN=0; SC_FAIL=0
 
 sc_add() {
-    local result="$1" label="$2"
+    local result="$1" label="$2" hint="${3:-}"
     SC_LABELS+=("$label")
     SC_RESULTS+=("$result")
+    SC_HINTS+=("$hint")
     case "$result" in
         PASS) ((SC_PASS++)) ;;
         WARN) ((SC_WARN++)) ;;
@@ -1248,7 +1250,7 @@ mod_verify() {
     if [[ -n "$allow_users" ]]; then
         sc_add "PASS" "AllowUsers configured: $allow_users"
     else
-        sc_add "WARN" "AllowUsers not set (all users can SSH)"
+        sc_add "WARN" "AllowUsers not set (all users can SSH)" "will fix"
     fi
 
     # SSH keys
@@ -1258,26 +1260,26 @@ mod_verify() {
         key_count=$(grep -c "^ssh-" "$auth_keys" || true)
         sc_add "PASS" "SSH authorized_keys has $key_count key(s)"
     else
-        sc_add "FAIL" "No SSH keys in authorized_keys"
+        sc_add "FAIL" "No SSH keys in authorized_keys" "will fix"
     fi
 
     # Banner
     if [[ -f "/etc/ssh/banner.txt" ]]; then
         sc_add "PASS" "SSH banner configured"
     else
-        sc_add "WARN" "No SSH banner"
+        sc_add "WARN" "No SSH banner" "will fix"
     fi
 
     # Firewall
     if command -v ufw &>/dev/null && ufw status | grep -q "^Status: active"; then
         sc_add "PASS" "UFW active, default deny"
     else
-        sc_add "FAIL" "UFW not active"
+        sc_add "FAIL" "UFW not active" "will fix"
     fi
 
     # Check SSH not open to Anywhere (0.0.0.0/0)
     if ufw status 2>/dev/null | grep "22/tcp" | grep -q "Anywhere" | grep -v "on wt0"; then
-        sc_add "WARN" "SSH (22/tcp) open to Anywhere"
+        sc_add "WARN" "SSH (22/tcp) open to Anywhere" "needs --netbird-key"
     else
         sc_add "PASS" "SSH restricted (not open to 0.0.0.0)"
     fi
@@ -1287,10 +1289,10 @@ mod_verify() {
         if fail2ban-client status sshd &>/dev/null; then
             sc_add "PASS" "fail2ban sshd jail active"
         else
-            sc_add "WARN" "fail2ban installed but sshd jail not active"
+            sc_add "WARN" "fail2ban installed but sshd jail not active" "will fix"
         fi
     else
-        sc_add "FAIL" "fail2ban not installed"
+        sc_add "FAIL" "fail2ban not installed" "will fix"
     fi
 
     # Kernel hardening
@@ -1299,7 +1301,7 @@ mod_verify() {
     if [[ "$syncookies" == "1" ]]; then
         sc_add "PASS" "SYN cookies enabled"
     else
-        sc_add "WARN" "SYN cookies disabled"
+        sc_add "WARN" "SYN cookies disabled" "will fix"
     fi
 
     local redirects
@@ -1307,7 +1309,7 @@ mod_verify() {
     if [[ "$redirects" == "0" ]]; then
         sc_add "PASS" "ICMP redirects disabled"
     else
-        sc_add "WARN" "ICMP redirects enabled"
+        sc_add "WARN" "ICMP redirects enabled" "will fix"
     fi
 
     local source_route
@@ -1315,7 +1317,7 @@ mod_verify() {
     if [[ "$source_route" == "0" ]]; then
         sc_add "PASS" "Source routing disabled"
     else
-        sc_add "WARN" "Source routing enabled"
+        sc_add "WARN" "Source routing enabled" "will fix"
     fi
 
     local martians
@@ -1323,7 +1325,7 @@ mod_verify() {
     if [[ "$martians" == "1" ]]; then
         sc_add "PASS" "Martian logging enabled"
     else
-        sc_add "WARN" "Martian logging disabled"
+        sc_add "WARN" "Martian logging disabled" "will fix"
     fi
 
     # Auditd
@@ -1335,27 +1337,27 @@ mod_verify() {
             if [[ "$audit_rule_count" -gt 0 ]]; then
                 sc_add "PASS" "Audit rules loaded ($audit_rule_count rules)"
             else
-                sc_add "WARN" "auditd active but no rules loaded"
+                sc_add "WARN" "auditd active but no rules loaded" "will fix"
             fi
         else
-            sc_add "WARN" "auditd installed but not active"
+            sc_add "WARN" "auditd installed but not active" "will fix"
         fi
     else
-        sc_add "WARN" "auditd not installed"
+        sc_add "WARN" "auditd not installed" "will fix"
     fi
 
     # Logwatch
     if command -v logwatch &>/dev/null; then
         sc_add "PASS" "logwatch installed"
     else
-        sc_add "WARN" "logwatch not installed"
+        sc_add "WARN" "logwatch not installed" "will fix"
     fi
 
     # server-report
     if [[ -x /usr/local/bin/server-report ]]; then
         sc_add "PASS" "server-report installed"
     else
-        sc_add "WARN" "server-report not installed"
+        sc_add "WARN" "server-report not installed" "will fix"
     fi
 
     # Netbird
@@ -1363,24 +1365,24 @@ mod_verify() {
         if ip link show wt0 &>/dev/null; then
             sc_add "PASS" "Netbird connected, wt0 up"
         else
-            sc_add "WARN" "Netbird installed but wt0 not up"
+            sc_add "WARN" "Netbird installed but wt0 not up" "needs --netbird-key"
         fi
     else
-        sc_add "WARN" "Netbird not installed"
+        sc_add "WARN" "Netbird not installed" "needs --netbird-key"
     fi
 
     # SOPS + age
     if command -v sops &>/dev/null && command -v age &>/dev/null; then
         sc_add "PASS" "SOPS + age installed"
     else
-        sc_add "WARN" "SOPS and/or age not installed"
+        sc_add "WARN" "SOPS and/or age not installed" "will fix"
     fi
 
     # Unattended upgrades
     if dpkg -l unattended-upgrades 2>/dev/null | grep -q "^ii"; then
         sc_add "PASS" "Unattended upgrades enabled"
     else
-        sc_add "WARN" "Unattended upgrades not configured"
+        sc_add "WARN" "Unattended upgrades not configured" "will fix"
     fi
 
     # Root password locked
@@ -1389,13 +1391,13 @@ mod_verify() {
     if [[ "$root_pw" == "L" ]]; then
         sc_add "PASS" "Root password locked"
     else
-        sc_add "WARN" "Root password not locked"
+        sc_add "WARN" "Root password not locked" "will fix"
     fi
 
     # Plaintext secrets
     local user_bashrc="/home/${USERNAME}/.bashrc"
     if [[ -f "$user_bashrc" ]] && grep -qEi '(api.?key|secret|token|password)\s*=\s*["\x27]?[a-zA-Z0-9_-]{20,}' "$user_bashrc" 2>/dev/null; then
-        sc_add "FAIL" "Plaintext secrets in .bashrc"
+        sc_add "FAIL" "Plaintext secrets in .bashrc" "manual cleanup needed"
     else
         sc_add "PASS" "No plaintext secrets in .bashrc"
     fi
@@ -1407,7 +1409,7 @@ mod_verify() {
         if [[ "$ak_perms" == "600" ]]; then
             sc_add "PASS" "authorized_keys permissions 600"
         else
-            sc_add "WARN" "authorized_keys permissions are $ak_perms (should be 600)"
+            sc_add "WARN" "authorized_keys permissions are $ak_perms (should be 600)" "will fix"
         fi
     fi
 
@@ -1417,16 +1419,28 @@ mod_verify() {
     echo -e "${BOLD}               VPS SECURITY SCORECARD${NC}"
     echo -e "${BOLD}====================================================================${NC}"
 
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo ""
+        echo -e "  ${YELLOW}NOTE: This scorecard shows the CURRENT state before hardening.${NC}"
+        echo -e "  ${YELLOW}      Items marked \"← will fix\" will be resolved on a real run.${NC}"
+    fi
+    echo ""
+
     for i in "${!SC_LABELS[@]}"; do
         local result="${SC_RESULTS[$i]}"
         local label="${SC_LABELS[$i]}"
+        local hint="${SC_HINTS[$i]}"
         local color
         case "$result" in
             PASS) color="$GREEN" ;;
             WARN) color="$YELLOW" ;;
             FAIL) color="$RED" ;;
         esac
-        printf "  ${color}[%s]${NC} %s\n" "$result" "$label"
+        if [[ "$DRY_RUN" == "true" && -n "$hint" && "$result" != "PASS" ]]; then
+            printf "  ${color}[%s]${NC} %-48s ${CYAN}← %s${NC}\n" "$result" "$label" "$hint"
+        else
+            printf "  ${color}[%s]${NC} %s\n" "$result" "$label"
+        fi
     done
 
     echo -e "${BOLD}--------------------------------------------------------------------${NC}"
@@ -1438,7 +1452,12 @@ mod_verify() {
     log_raw "SCORECARD: $SC_PASS PASS | $SC_WARN WARN | $SC_FAIL FAIL"
 
     if [[ $SC_FAIL -gt 0 ]]; then
-        log_warn "There are $SC_FAIL FAILED checks — review and fix them"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo -e "  ${CYAN}Items marked \"← will fix\" will be resolved when you run for real.${NC}"
+            echo ""
+        else
+            log_warn "There are $SC_FAIL FAILED checks — review and fix them"
+        fi
     fi
 }
 
@@ -1453,8 +1472,26 @@ check_ssh_setting() {
     if [[ "$actual_lower" == "$expected_lower" ]]; then
         sc_add "PASS" "${setting} = ${actual}"
     else
-        sc_add "FAIL" "${setting} = ${actual} (expected ${expected})"
+        sc_add "FAIL" "${setting} = ${actual} (expected ${expected})" "will fix"
     fi
+}
+
+# ── Build re-run command ──────────────────────────────────────────────────────
+# Builds the equivalent CLI command from current variable state.
+# Pass "true" as $1 to include --dry-run, omit or "false" to exclude it.
+build_rerun_cmd() {
+    local include_dry_run="${1:-false}"
+    local cmd="sudo ./vps-harden.sh --username ${USERNAME}"
+    if [[ -n "$SSH_KEY" && "$SSH_KEY" != "<wizard>" ]]; then
+        cmd+=" --ssh-key ${SSH_KEY}"
+    elif [[ -n "$SSH_KEY_CONTENT" ]]; then
+        cmd+=" --ssh-key \"$(echo "$SSH_KEY_CONTENT" | head -1)\""
+    fi
+    [[ -n "$SSH_SAFETY_IP" ]] && cmd+=" --ssh-safety-ip ${SSH_SAFETY_IP}"
+    [[ -n "$TIMEZONE" ]] && cmd+=" --timezone ${TIMEZONE}"
+    [[ -n "$NETBIRD_KEY" ]] && cmd+=" --netbird-key ${NETBIRD_KEY}"
+    [[ "$include_dry_run" == "true" ]] && cmd+=" --dry-run"
+    echo "$cmd"
 }
 
 # ── Interactive Setup Wizard ──────────────────────────────────────────────────
@@ -1715,17 +1752,12 @@ interactive_setup() {
     echo ""
 
     # Build equivalent CLI command
-    local cli_cmd="sudo ./vps-harden.sh --username ${USERNAME}"
-    if [[ -n "$SSH_KEY" ]]; then
-        cli_cmd+=" --ssh-key ${SSH_KEY}"
-    elif [[ -n "$SSH_KEY_CONTENT" ]]; then
-        # Use first key inline (truncated for display)
-        cli_cmd+=" --ssh-key \"$(echo "$SSH_KEY_CONTENT" | head -1)\""
+    local cli_cmd
+    if [[ "$DRY_RUN" == "true" ]]; then
+        cli_cmd=$(build_rerun_cmd "true")
+    else
+        cli_cmd=$(build_rerun_cmd "false")
     fi
-    [[ -n "$SSH_SAFETY_IP" ]] && cli_cmd+=" --ssh-safety-ip ${SSH_SAFETY_IP}"
-    [[ -n "$TIMEZONE" ]] && cli_cmd+=" --timezone ${TIMEZONE}"
-    [[ -n "$NETBIRD_KEY" ]] && cli_cmd+=" --netbird-key ${NETBIRD_KEY}"
-    [[ "$DRY_RUN" == "true" ]] && cli_cmd+=" --dry-run"
 
     echo "   For future runs:"
     echo -e "   ${CYAN}${cli_cmd}${NC}"
@@ -1799,7 +1831,10 @@ main() {
     echo ""
     log_info "Done. Log saved to $LOG_FILE"
     if [[ "$DRY_RUN" == "true" ]]; then
-        echo -e "${YELLOW}This was a dry run. Run without --dry-run to apply changes.${NC}"
+        local rerun_cmd
+        rerun_cmd=$(build_rerun_cmd "false")
+        echo -e "${YELLOW}This was a dry run. To apply changes, run:${NC}"
+        echo -e "  ${CYAN}${rerun_cmd}${NC}"
     fi
 }
 
