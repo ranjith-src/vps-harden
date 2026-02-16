@@ -20,18 +20,22 @@ echo "Installing ${BINARY_NAME}..."
 LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
     | grep '"tag_name"' | sed 's/.*"\(.*\)".*/\1/' || true)
 
+DOWNLOADED=false
+
 if [[ -n "$LATEST_TAG" ]]; then
     echo "Latest release: ${LATEST_TAG}"
-    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/vps-harden.sh"
-else
-    echo "No releases found, downloading from main branch..."
-    DOWNLOAD_URL="https://raw.githubusercontent.com/${REPO}/main/vps-harden.sh"
+    RELEASE_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/vps-harden.sh"
+    if curl -fsSL "$RELEASE_URL" -o "${INSTALL_DIR}/${BINARY_NAME}" 2>/dev/null; then
+        DOWNLOADED=true
+    fi
 fi
 
-# Download
-if ! curl -fsSL "$DOWNLOAD_URL" -o "${INSTALL_DIR}/${BINARY_NAME}"; then
-    echo "Error: Failed to download ${BINARY_NAME}" >&2
-    exit 1
+if [[ "$DOWNLOADED" != "true" ]]; then
+    echo "Downloading from main branch..."
+    if ! curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/vps-harden.sh" -o "${INSTALL_DIR}/${BINARY_NAME}"; then
+        echo "Error: Failed to download ${BINARY_NAME}" >&2
+        exit 1
+    fi
 fi
 
 chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
