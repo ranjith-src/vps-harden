@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly SCRIPT_VERSION="1.3.4"
+readonly SCRIPT_VERSION="1.3.5"
 LOG_FILE="/var/log/vps-harden-$(date +%Y%m%d-%H%M%S).log"
 readonly LOG_FILE
 readonly ALL_MODULES="prereqs user ssh firewall fail2ban sysctl netbird firewall_tighten sops upgrades monitoring shell misc verify"
@@ -1488,12 +1488,36 @@ mod_verify() {
         local server_ip
         server_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_SERVER_IP")
 
+        # Detect key type and comment for SSH config hint
+        local key_type_raw key_comment id_file_name
+        key_type_raw=$(head -1 "/home/${USERNAME}/.ssh/authorized_keys" 2>/dev/null | awk '{print $1}')
+        key_comment=$(head -1 "/home/${USERNAME}/.ssh/authorized_keys" 2>/dev/null | awk '{print $3}')
+        case "$key_type_raw" in
+            ssh-ed25519)       id_file_name="id_ed25519" ;;
+            ssh-rsa)           id_file_name="id_rsa" ;;
+            ecdsa-sha2-*)      id_file_name="id_ecdsa" ;;
+            *)                 id_file_name="id_ed25519" ;;
+        esac
+
         echo -e "  ${BOLD}NEXT STEPS:${NC}"
         echo ""
         echo -e "  ${YELLOW}⚠  IMPORTANT — Verify SSH access before closing this session!${NC}"
         echo "     Password auth is now disabled. Open a NEW terminal and run:"
-        echo -e "       ${CYAN}ssh ${USERNAME}@${server_ip}${NC}"
+        echo -e "       ${CYAN}ssh -i ~/.ssh/${id_file_name} ${USERNAME}@${server_ip}${NC}"
         echo "     If you can log in, you're all set. If not, DON'T close this session."
+        echo ""
+        echo "  • Add this to ${BOLD}~/.ssh/config${NC} on your LOCAL machine:"
+        echo ""
+        echo -e "      ${CYAN}Host my-vps${NC}"
+        echo -e "      ${CYAN}    HostName ${server_ip}${NC}"
+        echo -e "      ${CYAN}    User ${USERNAME}${NC}"
+        printf "      ${CYAN}    IdentityFile ~/.ssh/%s${NC}" "$id_file_name"
+        if [[ -n "$key_comment" ]]; then
+            printf "  ${CYAN}# %s${NC}" "$key_comment"
+        fi
+        echo ""
+        echo ""
+        echo "    Then connect with: ${CYAN}ssh my-vps${NC}"
 
         if [[ "$has_netbird_warn" == "true" ]]; then
             echo ""
