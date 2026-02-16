@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # vps-harden.sh — Idempotent VPS security hardening script
 # https://github.com/ranjith-src/vps-harden
-# Usage: sudo ./vps-harden.sh --username USER --ssh-key KEY [options]
+# Usage: sudo vps-harden --username USER --ssh-key KEY [options]
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -213,7 +213,7 @@ Modules (execution order):
 
 Examples:
   # Interactive wizard (recommended for first run):
-  sudo ./vps-harden.sh
+  sudo vps-harden
 
   # New VPS:
   sudo vps-harden --username deploy \
@@ -1481,7 +1481,7 @@ check_ssh_setting() {
 # Pass "true" as $1 to include --dry-run, omit or "false" to exclude it.
 build_rerun_cmd() {
     local include_dry_run="${1:-false}"
-    local cmd="sudo ./vps-harden.sh --username ${USERNAME}"
+    local cmd="sudo vps-harden --username ${USERNAME}"
     if [[ -n "$SSH_KEY" && "$SSH_KEY" != "<wizard>" ]]; then
         cmd+=" --ssh-key ${SSH_KEY}"
     elif [[ -n "$SSH_KEY_CONTENT" ]]; then
