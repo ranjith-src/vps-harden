@@ -1508,14 +1508,14 @@ mod_verify() {
         echo ""
         echo -e "  • Add this to ${BOLD}~/.ssh/config${NC} on your LOCAL machine:"
         echo ""
-        echo -e "      ${CYAN}Host my-vps${NC}"
-        echo -e "      ${CYAN}    HostName ${server_ip}${NC}"
-        echo -e "      ${CYAN}    User ${USERNAME}${NC}"
-        printf "      ${CYAN}    IdentityFile ~/.ssh/%s${NC}" "$id_file_name"
+        echo "      Host my-vps"
+        echo "          HostName ${server_ip}"
+        echo "          User ${USERNAME}"
         if [[ -n "$key_comment" ]]; then
-            printf "  ${CYAN}# %s${NC}" "$key_comment"
+            printf "          IdentityFile ~/.ssh/%s  # %s\n" "$id_file_name" "$key_comment"
+        else
+            printf "          IdentityFile ~/.ssh/%s\n" "$id_file_name"
         fi
-        echo ""
         echo ""
         echo -e "    Then connect with: ${CYAN}ssh my-vps${NC}"
 
