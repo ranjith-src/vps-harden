@@ -1506,7 +1506,7 @@ mod_verify() {
         echo -e "       ${CYAN}ssh -i ~/.ssh/${id_file_name} ${USERNAME}@${server_ip}${NC}"
         echo "     If you can log in, you're all set. If not, DON'T close this session."
         echo ""
-        echo "  • Add this to ${BOLD}~/.ssh/config${NC} on your LOCAL machine:"
+        echo -e "  • Add this to ${BOLD}~/.ssh/config${NC} on your LOCAL machine:"
         echo ""
         echo -e "      ${CYAN}Host my-vps${NC}"
         echo -e "      ${CYAN}    HostName ${server_ip}${NC}"
@@ -1517,7 +1517,7 @@ mod_verify() {
         fi
         echo ""
         echo ""
-        echo "    Then connect with: ${CYAN}ssh my-vps${NC}"
+        echo -e "    Then connect with: ${CYAN}ssh my-vps${NC}"
 
         if [[ "$has_netbird_warn" == "true" ]]; then
             echo ""
