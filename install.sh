@@ -53,7 +53,5 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
 fi
 
 echo "Usage:"
-echo "  sudo ${BINARY_NAME} --username deploy --ssh-key \"ssh-ed25519 AAAA...\" --dry-run"
-echo ""
-echo "For help:"
-echo "  ${BINARY_NAME} --help"
+echo "  sudo ${BINARY_NAME}                # interactive setup wizard"
+echo "  sudo ${BINARY_NAME} --help         # all options"
