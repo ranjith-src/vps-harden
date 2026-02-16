@@ -48,46 +48,35 @@ Verify it's installed:
 vps-harden --version
 ```
 
-## Step 3: Dry run first
+## Step 3: Run the setup wizard
 
-**Always preview before applying.** The dry run shows exactly what would change without touching anything:
+The easiest way to get started is the interactive wizard. Just run:
 
 ```bash
-sudo vps-harden \
-  --username deploy \
-  --ssh-key "ssh-ed25519 AAAA... your-email@example.com" \
-  --ssh-safety-ip YOUR_LOCAL_IP \
-  --timezone UTC \
-  --dry-run
+sudo vps-harden
 ```
 
-Replace:
-- `deploy` with your preferred non-root username
-- `ssh-ed25519 AAAA...` with your actual public key (or a path to the file)
-- `YOUR_LOCAL_IP` with your current IP (from `curl -s ifconfig.me`)
+The wizard will:
+1. Ask for a username (auto-detects your current user)
+2. Find your SSH key (checks `authorized_keys`, or fetches from GitHub, or lets you paste one)
+3. Detect your IP for the safety-net SSH rule
+4. Detect your timezone
+5. Ask for an optional Netbird VPN key
+6. **Offer a dry run first** (recommended — shows what would change before touching anything)
 
-You'll see output like:
-
-```
-[DRY] Would: run: apt-get install -y -qq tree unzip fail2ban
-[DRY] Would: write /etc/ssh/sshd_config.d/00-hardening.conf (mode=644)
-[DRY] Would: run: ufw --force enable
-...
-```
-
-Review this output. Every change is listed. Nothing has been modified yet.
+> **Prefer CLI flags?** You can skip the wizard and pass everything directly:
+>
+> ```bash
+> sudo vps-harden --username deploy \
+>   --ssh-key "ssh-ed25519 AAAA..." \
+>   --ssh-safety-ip YOUR_LOCAL_IP \
+>   --timezone UTC \
+>   --dry-run
+> ```
 
 ## Step 4: Apply
 
-Once you're comfortable with the dry run output, run it for real:
-
-```bash
-sudo vps-harden \
-  --username deploy \
-  --ssh-key "ssh-ed25519 AAAA... your-email@example.com" \
-  --ssh-safety-ip YOUR_LOCAL_IP \
-  --timezone UTC
-```
+If you chose dry run in the wizard, review the output — every change is listed. Then run again without dry run to apply. The wizard prints the exact CLI command to re-run at the end.
 
 Here's what each module does and why:
 
@@ -95,7 +84,7 @@ Here's what each module does and why:
 |------|--------|-------------|-----|
 | 1 | `prereqs` | Installs foundational packages (curl, wget, jq, htop, ufw, fail2ban) | These are dependencies for the rest of the script and useful for day-to-day admin |
 | 2 | `user` | Creates a non-root user with sudo access and deploys your SSH key | Running as root is dangerous — a typo can destroy the system. A dedicated user with sudo gives you the same power with an audit trail |
-| 3 | `ssh` | Disables root login, limits auth attempts to 3, restricts SSH to your user only, adds a warning banner | SSH is the #1 attack surface on any VPS. Brute-force bots will find your server within minutes of it going online |
+| 3 | `ssh` | Disables root login, disables password auth, limits auth attempts to 3, restricts SSH to your user only, adds a warning banner | SSH is the #1 attack surface on any VPS. Brute-force bots will find your server within minutes of it going online |
 | 4 | `firewall` | Enables UFW with deny-all-incoming, allow-all-outgoing, and an SSH exception | Without a firewall, every open port is exposed. Default-deny means only services you explicitly allow are reachable |
 | 5 | `fail2ban` | Bans IPs after 3 failed SSH attempts for 3 hours | Even with key-only SSH, bots hammering your auth log wastes resources and clutters logs. fail2ban stops them early |
 | 6 | `sysctl` | Enables SYN cookies, disables ICMP redirects and source routing, enables martian logging | Kernel-level protections against SYN floods, routing attacks, and spoofed packets. These are low-cost, high-value hardening |
@@ -112,11 +101,22 @@ Here's what each module does and why:
 
 ## Step 5: Test SSH access (important!)
 
-**Before closing your current session**, open a **new terminal** and test:
+**Before closing your current session**, open a **new terminal** and test. The script prints the exact command in the **Next Steps** section:
 
 ```bash
-ssh deploy@YOUR_VPS_IP
+ssh -i ~/.ssh/id_ed25519 deploy@YOUR_VPS_IP
 ```
+
+If you have multiple SSH keys, the `-i` flag ensures the correct one is used. The script also prints a ready-to-paste `~/.ssh/config` block you can add on your local machine:
+
+```
+Host my-vps
+    HostName YOUR_VPS_IP
+    User deploy
+    IdentityFile ~/.ssh/id_ed25519
+```
+
+Then connect with just `ssh my-vps`.
 
 If this works, you're good. If it doesn't, you still have your original session to fix things.
 
@@ -127,31 +127,65 @@ Once confirmed:
 
 ## Step 6: Read the scorecard
 
-At the end of the run, you'll see something like:
+At the end of the run, you'll see a grouped scorecard with section headers:
 
 ```
 ====================================================================
                VPS SECURITY SCORECARD
 ====================================================================
+
+  ── SSH Hardening — Locks down remote access ──
   [PASS] PermitRootLogin = no
+  [PASS] PasswordAuthentication = no
   [PASS] MaxAuthTries = 3
+  ...
+
+  ── Firewall — Controls network traffic ──
   [PASS] UFW active, default deny
+  [PASS] SSH restricted (not open to 0.0.0.0)
+
+  ── Intrusion Prevention — Blocks brute-force attacks ──
   [PASS] fail2ban sshd jail active
+
+  ── Kernel Hardening — Prevents network-level attacks ──
   [PASS] SYN cookies enabled
+  ...
+
+  ── Monitoring — Tracks system activity and threats ──
   [PASS] auditd active
   [PASS] Audit rules loaded (13 rules)
   [PASS] logwatch installed
   [PASS] server-report installed
+
+  ── Network — Secure mesh VPN tunnel ──
   [WARN] Netbird not installed
-  ...
+
+  ── Secrets — Encrypted credential management ──
+  [PASS] SOPS + age installed
+
+  ── System — OS-level security hygiene ──
+  [PASS] Unattended upgrades enabled
+  [PASS] Root password locked
+  [PASS] No plaintext secrets in .bashrc
+  [PASS] authorized_keys permissions 600
 --------------------------------------------------------------------
-  SCORE: 20 PASSED | 2 WARNING | 0 FAILED
+  SCORE: 24 PASSED | 1 WARNING | 0 FAILED
 --------------------------------------------------------------------
+
+  NEXT STEPS:
+
+  ⚠  IMPORTANT — Verify SSH access before closing this session!
+     ...
+
+  • Add this to ~/.ssh/config on your LOCAL machine:
+     ...
 ```
 
 - **PASS** — correctly configured, no action needed
 - **WARN** — not critical, but review (e.g. Netbird not set up is fine if you don't need VPN)
 - **FAIL** — something needs fixing. The label explains what's wrong
+
+In **dry-run mode**, items that would be fixed on a real run are annotated with `← will fix`.
 
 ## Step 7: Optional — Set up Netbird VPN
 

@@ -37,7 +37,7 @@ Most VPS hardening guides are long checklists you follow manually. Most scripts 
 - **Dry-run mode** — preview every change before applying. Nothing is modified until you're ready.
 - **Modular** — run all 14 modules or pick only what you need with `--skip` and `--only`.
 - **Lockout protection** — validates SSH config, keys, firewall rules, and AllowUsers before restarting. Auto-rolls back on failure.
-- **Non-interactive** — fully CLI-driven. No prompts. Automate it in CI, cron, or cloud-init.
+- **Interactive or CLI** — setup wizard for first runs, fully non-interactive CLI for automation.
 - **Single file, zero dependencies** — just Bash. No Python, no Ansible, no agents.
 
 ---
@@ -50,21 +50,22 @@ Most VPS hardening guides are long checklists you follow manually. Most scripts 
 curl -fsSL https://raw.githubusercontent.com/ranjith-src/vps-harden/main/install.sh | bash
 ```
 
-**Preview what would change (dry run):**
+**Interactive wizard (recommended for first run):**
 
 ```bash
-sudo vps-harden --username deploy \
-  --ssh-key "ssh-ed25519 AAAA..." \
-  --dry-run
+sudo vps-harden
 ```
 
-**Apply:**
+The wizard auto-detects SSH keys, your IP, and timezone — then offers a dry run before applying.
+
+**Or use CLI flags directly:**
 
 ```bash
 sudo vps-harden --username deploy \
   --ssh-key "ssh-ed25519 AAAA..." \
   --ssh-safety-ip 203.0.113.10 \
-  --timezone UTC
+  --timezone UTC \
+  --dry-run
 ```
 
 > **New to VPS security?** The [Getting Started guide](docs/getting-started.md) walks you through everything step by step, including why each module matters.
@@ -79,7 +80,7 @@ sudo vps-harden --username deploy \
 |--------|-------------|-----|
 | `prereqs` | Installs curl, wget, jq, htop, tree, unzip, ufw, fail2ban | Foundation packages for the rest of the script |
 | `user` | Creates non-root user, adds to sudo, deploys SSH keys | Running as root is dangerous — sudo gives the same power with an audit trail |
-| `ssh` | Disables root login, MaxAuthTries 3, AllowUsers, banner | SSH is the #1 attack surface. Bots find your server within minutes |
+| `ssh` | Disables root login, disables password auth, MaxAuthTries 3, AllowUsers, banner | SSH is the #1 attack surface. Bots find your server within minutes |
 | `firewall` | UFW: deny incoming, allow outgoing, allow SSH | Default-deny means only services you explicitly allow are reachable |
 | `fail2ban` | 3 retries, 3h ban, UFW integration | Stops brute-force bots from hammering your auth log |
 | `sysctl` | SYN cookies, disable ICMP redirects/source routing, martian logging, RP filtering | Kernel-level protection against floods, routing attacks, spoofed packets |
@@ -96,28 +97,57 @@ sudo vps-harden --username deploy \
 
 ## Security Scorecard
 
-The `verify` module prints a scorecard at the end of every run:
+The `verify` module prints a grouped scorecard at the end of every run. Section headers explain what each group does:
 
 ```
 ====================================================================
                VPS SECURITY SCORECARD
 ====================================================================
+
+  ── SSH Hardening — Locks down remote access ──
   [PASS] PermitRootLogin = no
+  [PASS] PasswordAuthentication = no
   [PASS] MaxAuthTries = 3
+  ...
+  [PASS] SSH banner configured
+
+  ── Firewall — Controls network traffic ──
   [PASS] UFW active, default deny
+  [PASS] SSH restricted (not open to 0.0.0.0)
+
+  ── Intrusion Prevention — Blocks brute-force attacks ──
   [PASS] fail2ban sshd jail active
+
+  ── Kernel Hardening — Prevents network-level attacks ──
   [PASS] SYN cookies enabled
+  [PASS] ICMP redirects disabled
+  ...
+
+  ── Monitoring — Tracks system activity and threats ──
   [PASS] auditd active
   [PASS] Audit rules loaded (13 rules)
   [PASS] logwatch installed
   [PASS] server-report installed
-  [PASS] Root password locked
+
+  ── Network — Secure mesh VPN tunnel ──
   [WARN] Netbird not installed
-  ...
+
+  ── Secrets — Encrypted credential management ──
+  [PASS] SOPS + age installed
+
+  ── System — OS-level security hygiene ──
+  [PASS] Unattended upgrades enabled
+  [PASS] Root password locked
+  [PASS] No plaintext secrets in .bashrc
+  [PASS] authorized_keys permissions 600
 --------------------------------------------------------------------
-  SCORE: 22 PASSED | 1 WARNING | 0 FAILED
+  SCORE: 24 PASSED | 1 WARNING | 0 FAILED
 --------------------------------------------------------------------
 ```
+
+After a real run, the scorecard shows **next steps** — an SSH verification warning (test key-based login before closing your session), a ready-to-paste `~/.ssh/config` block, and conditional guidance for any WARN/FAIL items.
+
+In **dry-run mode**, items that would be fixed on a real run are annotated with `← will fix`.
 
 Run the scorecard anytime to check for drift:
 
@@ -148,8 +178,11 @@ All output is plain text — no colors, no control codes. Safe for piping, loggi
 
 | Flag | Required | Description |
 |------|----------|-------------|
-| `--username USER` | Yes | Non-root user to create/harden |
-| `--ssh-key KEY` | Yes | SSH public key (file path or inline `ssh-*` string) |
+| `--username USER` | Yes* | Non-root user to create/harden |
+| `--ssh-key KEY` | Yes* | SSH public key (file path or inline `ssh-*` string) |
+| `--interactive` | No | Force interactive setup wizard |
+
+\* Not required when using the interactive wizard (`sudo vps-harden` with no args).
 | `--ssh-safety-ip IP` | No | IP to always allow SSH from (safety net before tightening) |
 | `--netbird-key KEY` | No | Netbird setup key for mesh VPN (skips VPN module if omitted) |
 | `--timezone TZ` | No | System timezone (e.g. `Europe/Amsterdam`, `UTC`) |
