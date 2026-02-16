@@ -1,12 +1,46 @@
 # vps-harden
 
+**One script. No dependencies. Dry-run first. Lockout protection built in.**
+
+Idempotent Bash script to harden a Debian/Ubuntu VPS. Run it once on a fresh server or repeatedly to verify and fix drift. Every change is previewed before it's applied, and SSH lockout protection rolls back automatically if something goes wrong.
+
 [![CI](https://github.com/ranjith-src/vps-harden/actions/workflows/ci.yml/badge.svg)](https://github.com/ranjith-src/vps-harden/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![ShellCheck](https://img.shields.io/badge/ShellCheck-passing-brightgreen)](https://www.shellcheck.net/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![GitHub release](https://img.shields.io/github/v/release/ranjith-src/vps-harden)](https://github.com/ranjith-src/vps-harden/releases)
+[![GitHub stars](https://img.shields.io/github/stars/ranjith-src/vps-harden?style=social)](https://github.com/ranjith-src/vps-harden)
 
-Idempotent VPS security hardening script for Debian/Ubuntu. Run it once on a fresh VPS or repeatedly to verify and fix drift.
+---
 
-> **New here?** Start with the [Getting Started guide](docs/getting-started.md) — it walks you through the full setup in about 10 minutes.
+## Table of Contents
+
+- [Why vps-harden](#why-vps-harden)
+- [Quick Start](#quick-start)
+- [What It Does](#what-it-does)
+- [Security Scorecard](#security-scorecard)
+- [server-report](#server-report)
+- [Parameters](#parameters)
+- [Config File](#config-file)
+- [Lockout Protection](#lockout-protection)
+- [Compatibility](#compatibility)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
+## Why vps-harden
+
+Most VPS hardening guides are long checklists you follow manually. Most scripts are interactive, not idempotent, and will break if you run them twice. This tool is different:
+
+- **Idempotent** — checks current state before every action. Safe to re-run anytime.
+- **Dry-run mode** — preview every change before applying. Nothing is modified until you're ready.
+- **Modular** — run all 14 modules or pick only what you need with `--skip` and `--only`.
+- **Lockout protection** — validates SSH config, keys, firewall rules, and AllowUsers before restarting. Auto-rolls back on failure.
+- **Non-interactive** — fully CLI-driven. No prompts. Automate it in CI, cron, or cloud-init.
+- **Single file, zero dependencies** — just Bash. No Python, no Ansible, no agents.
+
+---
 
 ## Quick Start
 
@@ -16,7 +50,7 @@ Idempotent VPS security hardening script for Debian/Ubuntu. Run it once on a fre
 curl -fsSL https://raw.githubusercontent.com/ranjith-src/vps-harden/main/install.sh | bash
 ```
 
-**First run (dry run):**
+**Preview what would change (dry run):**
 
 ```bash
 sudo vps-harden --username deploy \
@@ -33,6 +67,83 @@ sudo vps-harden --username deploy \
   --timezone UTC
 ```
 
+> **New to VPS security?** The [Getting Started guide](docs/getting-started.md) walks you through everything step by step, including why each module matters.
+
+---
+
+## What It Does
+
+14 modules run in order. Each is idempotent — safe to re-run.
+
+| Module | What it does | Why |
+|--------|-------------|-----|
+| `prereqs` | Installs curl, wget, jq, htop, tree, unzip, ufw, fail2ban | Foundation packages for the rest of the script |
+| `user` | Creates non-root user, adds to sudo, deploys SSH keys | Running as root is dangerous — sudo gives the same power with an audit trail |
+| `ssh` | Disables root login, MaxAuthTries 3, AllowUsers, banner | SSH is the #1 attack surface. Bots find your server within minutes |
+| `firewall` | UFW: deny incoming, allow outgoing, allow SSH | Default-deny means only services you explicitly allow are reachable |
+| `fail2ban` | 3 retries, 3h ban, UFW integration | Stops brute-force bots from hammering your auth log |
+| `sysctl` | SYN cookies, disable ICMP redirects/source routing, martian logging, RP filtering | Kernel-level protection against floods, routing attacks, spoofed packets |
+| `netbird` | Installs Netbird mesh VPN, connects with setup key | Hide SSH from the public internet — only VPN peers can reach it |
+| `firewall_tighten` | Allows VPN tunnel traffic, restricts SSH to safety IP, removes broad rules | Once VPN is up, close the public SSH door |
+| `sops` | Installs SOPS + age, generates encryption keypair | Encrypted-at-rest secrets management for API keys and credentials |
+| `upgrades` | Enables unattended-upgrades, optional auto-reboot | Most breaches exploit known vulnerabilities with patches already available |
+| `monitoring` | Installs auditd + logwatch, deploys audit rules, installs [`server-report`](#server-report) | You can't protect what you can't see |
+| `shell` | umask 027, bash history with timestamps, plaintext secret scanning | Prevents accidental world-readable files, aids forensics |
+| `misc` | Timezone, hostname, lock root password, restrict `su` | Locks down remaining escalation paths |
+| `verify` | Runs all checks, prints security scorecard | Single view of your security posture |
+
+---
+
+## Security Scorecard
+
+The `verify` module prints a scorecard at the end of every run:
+
+```
+====================================================================
+               VPS SECURITY SCORECARD
+====================================================================
+  [PASS] PermitRootLogin = no
+  [PASS] MaxAuthTries = 3
+  [PASS] UFW active, default deny
+  [PASS] fail2ban sshd jail active
+  [PASS] SYN cookies enabled
+  [PASS] auditd active
+  [PASS] Audit rules loaded (13 rules)
+  [PASS] logwatch installed
+  [PASS] server-report installed
+  [PASS] Root password locked
+  [WARN] Netbird not installed
+  ...
+--------------------------------------------------------------------
+  SCORE: 22 PASSED | 1 WARNING | 0 FAILED
+--------------------------------------------------------------------
+```
+
+Run the scorecard anytime to check for drift:
+
+```bash
+sudo vps-harden --username deploy --ssh-key ~/.ssh/authorized_keys --only verify
+```
+
+---
+
+## server-report
+
+The `monitoring` module installs a companion CLI for quick health checks:
+
+```bash
+sudo server-report summary   # Uptime, load, memory, disk, SSH attempts, services, updates
+sudo server-report auth       # Failed/successful logins (48h), sessions, banned IPs
+sudo server-report audit      # Audit events by key (ssh_config, user_db, sudoers, etc.)
+sudo server-report full       # Full logwatch report (today)
+```
+
+All output is plain text — no colors, no control codes. Safe for piping, logging, or chatbot consumption. Commands degrade gracefully if tools (auditd, logwatch, fail2ban) are not installed.
+
+**OpenClaw bot integration:** Add `--openclaw-skill` to automatically configure server-report as a chatbot skill, so your bot can answer "how's the server?" on demand.
+
+---
+
 ## Parameters
 
 | Flag | Required | Description |
@@ -44,92 +155,33 @@ sudo vps-harden --username deploy \
 | `--timezone TZ` | No | System timezone (e.g. `Europe/Amsterdam`, `UTC`) |
 | `--hostname NAME` | No | Set system hostname |
 | `--auto-reboot` | No | Enable automatic reboot after kernel updates |
-| `--openclaw-skill` | No | Add `server-report` skill to an OpenClaw bot (requires OpenClaw installed) |
+| `--openclaw-skill` | No | Add `server-report` skill to an OpenClaw bot |
 | `--skip MOD[,MOD]` | No | Comma-separated modules to skip |
 | `--only MOD[,MOD]` | No | Run only specified modules |
 | `--dry-run` | No | Preview changes without applying them |
 | `--config FILE` | No | Load parameters from a `KEY=VALUE` file |
-| `--no-color` | No | Disable colored output (useful for logging) |
+| `--no-color` | No | Disable colored output |
 | `--verbose` | No | Show command output instead of redirecting to log |
 | `--version` | No | Print version and exit |
 | `-h`, `--help` | No | Show usage help |
 
-## Modules
-
-Modules run in this order. Each is idempotent — safe to re-run.
-
-| Module | What it does |
-|--------|-------------|
-| `prereqs` | Installs curl, wget, jq, htop, tree, unzip, ufw, fail2ban |
-| `user` | Creates non-root user, adds to sudo group, deploys SSH keys |
-| `ssh` | Writes `/etc/ssh/sshd_config.d/00-hardening.conf` — disables root login, sets MaxAuthTries 3, AllowUsers, banner. Includes lockout protection with automatic rollback. |
-| `firewall` | Configures UFW: deny incoming, allow outgoing, allow SSH |
-| `fail2ban` | Configures fail2ban with UFW integration (3 retries, 3h ban) |
-| `sysctl` | Kernel hardening: SYN cookies, disable ICMP redirects/source routing, martian logging, reverse path filtering |
-| `netbird` | Installs Netbird mesh VPN and connects with setup key (skipped if no key) |
-| `firewall_tighten` | Allows traffic on VPN tunnel, restricts SSH to safety IP, removes broad SSH rules |
-| `sops` | Installs SOPS + age for encrypted secrets management, generates keypair |
-| `upgrades` | Enables unattended-upgrades, optional auto-reboot |
-| `monitoring` | Installs auditd + logwatch, deploys audit rules, installs [`server-report`](#server-report) CLI, adds sudoers NOPASSWD rule |
-| `shell` | Sets umask 027, configures bash history, scans for plaintext secrets |
-| `misc` | Sets timezone/hostname, locks root password, restricts `su` to sudo group |
-| `verify` | Runs all checks and prints a security scorecard |
-
-## Security Scorecard
-
-The `verify` module prints a scorecard at the end:
-
-```
-====================================================================
-               VPS SECURITY SCORECARD
-====================================================================
-  [PASS] PermitRootLogin = no
-  [PASS] MaxAuthTries = 3
-  [PASS] UFW active, default deny
-  [PASS] fail2ban sshd jail active
-  [WARN] Netbird installed but wt0 not up
-  ...
---------------------------------------------------------------------
-  SCORE: 18 PASSED | 2 WARNING | 0 FAILED
---------------------------------------------------------------------
-```
-
-- **PASS** — correctly configured
-- **WARN** — not critical but should be reviewed
-- **FAIL** — security issue that needs fixing
-
-## server-report
-
-The `monitoring` module installs a companion CLI for quick health checks:
-
-```bash
-sudo server-report summary   # Uptime, load, memory, disk, SSH, services, updates
-sudo server-report auth       # Failed/successful logins, sessions, banned IPs
-sudo server-report audit      # Audit events by key (ssh_config, user_db, etc.)
-sudo server-report full       # Full logwatch report (today)
-```
-
-All output is plain text with no colors — safe for piping, logging, or chatbot consumption. Commands degrade gracefully if tools (auditd, logwatch, fail2ban) are not installed.
+---
 
 ## Config File
 
-Instead of passing flags, use a config file:
+Instead of passing flags, use a config file for repeatable setups:
 
 ```bash
-sudo vps-harden --config config.env
+sudo vps-harden --config /root/harden.env
 ```
 
 See [`examples/config.env`](examples/config.env) for the format.
 
-## Requirements
-
-- **OS:** Debian 11+ or Ubuntu 20.04+
-- **Access:** Root (via `sudo`)
-- **Network:** Outbound internet access (for package installs)
+---
 
 ## Lockout Protection
 
-The SSH module includes multiple safeguards:
+The SSH module includes multiple safeguards to prevent you from losing access:
 
 1. Validates `sshd` config syntax before restarting
 2. Verifies SSH keys exist in `authorized_keys`
@@ -137,12 +189,44 @@ The SSH module includes multiple safeguards:
 4. Confirms UFW has an SSH allow rule
 5. Rolls back config automatically if any check fails
 
+If something goes wrong, your current SSH session stays alive and the config is reverted.
+
+---
+
+## Compatibility
+
+| OS | Version | Status |
+|----|---------|--------|
+| Ubuntu | 24.04 LTS | Tested |
+| Ubuntu | 22.04 LTS | Tested |
+| Ubuntu | 20.04 LTS | Tested |
+| Debian | 12 (Bookworm) | Supported |
+| Debian | 11 (Bullseye) | Supported |
+
+**Architecture:** amd64, arm64
+
+**Requirements:** Root access (via `sudo`), outbound internet for package installs.
+
+---
+
+## Documentation
+
+- **[Getting Started](docs/getting-started.md)** — Step-by-step onboarding guide with prerequisites, module explanations, troubleshooting
+- **[Changelog](https://github.com/ranjith-src/vps-harden/releases)** — Release notes for each version
+- **[Config Example](examples/config.env)** — Sample configuration file
+
+---
+
 ## Contributing
 
 1. Fork the repo
 2. Create a feature branch
 3. Ensure `shellcheck vps-harden.sh` passes
 4. Submit a pull request
+
+See open issues labeled [`good-first-issue`](https://github.com/ranjith-src/vps-harden/labels/good%20first%20issue) for ideas.
+
+---
 
 ## License
 
