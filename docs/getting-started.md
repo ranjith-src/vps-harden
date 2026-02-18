@@ -8,7 +8,7 @@ Before you start, have these ready:
 
 | Item | Required | Where to get it |
 |------|----------|-----------------|
-| A VPS running **Debian 11+** or **Ubuntu 20.04+** | Yes | Any provider (Hetzner, DigitalOcean, Linode, etc.) |
+| A VPS running **Ubuntu 20.04+** | Yes | Any provider (Hetzner, DigitalOcean, Linode, etc.) |
 | **Root access** (root password or sudo) | Yes | Your VPS provider's dashboard |
 | An **SSH key pair** | Yes | See [Generate an SSH key](#generate-an-ssh-key) below |
 | Your **current public IP** | Recommended | Run `curl -s ifconfig.me` on your local machine |
@@ -96,6 +96,15 @@ Here's what each module does and why:
 | 12 | `shell` | Sets umask 027, increases bash history with timestamps, scans for plaintext secrets | umask prevents accidental world-readable files. History timestamps help with incident forensics. Secret scanning catches accidental credential leaks |
 | 13 | `misc` | Sets timezone/hostname, locks root password, restricts `su` to sudo group | Locking root prevents password-based root login entirely. Restricting `su` means even if an attacker gets a shell, they can't escalate via `su` |
 | 14 | `verify` | Runs all checks and prints a security scorecard | A single view of your security posture. Run it anytime to check for drift |
+
+**Agent modules** (15–18, require `--agent-dir`):
+
+| Step | Module | What it does | Why |
+|------|--------|-------------|-----|
+| 15 | `agent_secrets` | Scans for plaintext API keys, checks SOPS encryption, deploys load-secrets helper | API keys in config files are the #1 agent security risk |
+| 16 | `agent_webhook_auth` | Checks webhook listener, UFW exposure, TLS proxy, auth, rate limiting | Webhooks are unauthenticated HTTP endpoints by default |
+| 17 | `agent_logging` | Creates log dir, logrotate, append-only flags, auditd rules | Tamper-evident logs for agent actions and API calls |
+| 18 | `agent_data` | Checks data dir permissions, gitignore, git history, encryption | Health data, user data, and PII need restricted access |
 
 > **Tip:** If a module fails, the script will continue with the remaining modules (except for the critical `user` and `ssh` modules, which abort on failure to prevent lockout).
 
@@ -220,6 +229,60 @@ sudo server-report auth        # Login attempts and bans
 sudo server-report audit       # Audit trail (config changes, privilege escalation)
 sudo server-report full        # Full logwatch report
 ```
+
+## Step 9: Agent Workspace Hardening (optional)
+
+If you run an AI agent on your VPS (e.g. an LLM chatbot, webhook receiver, or data pipeline), vps-harden can apply zero-trust hardening to the agent workspace. This is gated behind `--agent-dir` — users without agents are completely unaffected.
+
+The 4 agent modules check for:
+- **Plaintext secrets** in config files (API keys, tokens, credentials)
+- **Webhook security** (TLS proxy, auth verification, rate limiting, firewall exposure)
+- **Structured logging** (log directory permissions, logrotate, append-only flags, auditd rules)
+- **Data protection** (directory permissions, gitignore, git history leaks, encryption at rest)
+
+### Run agent hardening
+
+```bash
+sudo vps-harden --username deploy \
+  --ssh-key ~/.ssh/authorized_keys \
+  --agent-dir /home/deploy/.my-agent \
+  --webhook-port 5050 \
+  --agent-data-dir /home/deploy/.my-agent/data \
+  --dry-run
+```
+
+This adds an "Agent Security" section to the scorecard:
+
+```
+  ── Agent Security — AI agent workspace hardening ──
+  [PASS] No plaintext secrets in agent workspace
+  [PASS] SOPS-encrypted secrets file present
+  [PASS] Webhook listener active on port 5050
+  [PASS] Agent logs directory exists (750)
+  [PASS] Data directory permissions 700 (owner-only)
+```
+
+### Run only agent modules
+
+```bash
+sudo vps-harden --username deploy \
+  --ssh-key ~/.ssh/authorized_keys \
+  --agent-dir /home/deploy/.my-agent \
+  --only agent_secrets,agent_webhook_auth,agent_logging,agent_data,verify
+```
+
+### Config file
+
+You can also set agent parameters in your config file:
+
+```bash
+# /root/harden.env
+agent_dir=/home/deploy/.my-agent
+webhook_port=5050
+agent_data_dir=/home/deploy/.my-agent/data
+```
+
+> **Note:** All agent module checks are advisory — they report PASS/WARN/FAIL on the scorecard but never block execution. If `--agent-dir` is not provided, all 4 modules silently skip.
 
 ## Ongoing maintenance
 

@@ -1,8 +1,8 @@
 # VPS-Harden
 
-> Idempotent Bash script to harden a Debian/Ubuntu VPS. One script, zero dependencies, dry-run first, lockout protection built in.
+> Idempotent VPS hardening for Ubuntu — SSH, firewall, fail2ban, kernel tuning, auditd, SOPS secrets, and optional AI agent workspace security. Dry-run first, lockout protection built in.
 
-VPS-Harden is a single Bash script that secures a fresh or existing Debian/Ubuntu server. It runs 14 modules covering SSH hardening, firewall (UFW), fail2ban, kernel sysctl hardening, Netbird mesh VPN, SOPS+age secrets management, auditd monitoring, unattended upgrades, and more.
+VPS-Harden is a single Bash script that secures a fresh or existing Ubuntu server. It runs 18 modules covering SSH hardening, firewall (UFW), fail2ban, kernel sysctl hardening, Netbird mesh VPN, SOPS+age secrets management, auditd monitoring, unattended upgrades, and AI agent workspace hardening.
 
 Key properties:
 - Idempotent: checks current state before every action, safe to re-run anytime
@@ -36,7 +36,20 @@ Install: `curl -fsSL https://raw.githubusercontent.com/ranjith-src/vps-harden/ma
 - monitoring: Installs auditd + logwatch, deploys audit rules, installs server-report CLI
 - shell: umask 027, bash history with timestamps, plaintext secret scanning
 - misc: Timezone, hostname, lock root password, restrict su
+- agent_secrets: Scans agent workspace for plaintext secrets, checks SOPS encryption (needs --agent-dir)
+- agent_webhook_auth: Verifies webhook listener, UFW rules, TLS proxy, auth, rate limiting (needs --agent-dir)
+- agent_logging: Creates log directory, logrotate, append-only flags, auditd rules (needs --agent-dir)
+- agent_data: Checks data directory permissions, gitignore, git history, encryption (needs --agent-dir + --agent-data-dir)
 - verify: Runs all checks, prints grouped security scorecard with next steps
+
+## Agent Workspace Hardening
+
+The last 4 modules are gated behind `--agent-dir DIR` and silently skip if not provided. They add zero-trust hardening for AI agent workloads (LLM bots, webhook receivers, health data pipelines).
+
+Parameters:
+- `--agent-dir DIR`: Agent workspace directory (required to enable agent modules)
+- `--webhook-port PORT`: Webhook listener port (default: 5000)
+- `--agent-data-dir DIR`: Sensitive data directory to protect (used by agent_data module)
 
 ## Optional
 

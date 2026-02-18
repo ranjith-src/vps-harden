@@ -2,7 +2,7 @@
 
 **One script. No dependencies. Dry-run first. Lockout protection built in.**
 
-Idempotent Bash script to harden a Debian/Ubuntu VPS. Run it once on a fresh server or repeatedly to verify and fix drift. Every change is previewed before it's applied, and SSH lockout protection rolls back automatically if something goes wrong.
+Idempotent Bash script to harden an Ubuntu VPS. Run it once on a fresh server or repeatedly to verify and fix drift. Every change is previewed before it's applied, and SSH lockout protection rolls back automatically if something goes wrong.
 
 [![CI](https://github.com/ranjith-src/vps-harden/actions/workflows/ci.yml/badge.svg)](https://github.com/ranjith-src/vps-harden/actions/workflows/ci.yml)
 [![ShellCheck](https://img.shields.io/badge/ShellCheck-passing-brightgreen)](https://www.shellcheck.net/)
@@ -35,7 +35,7 @@ Most VPS hardening guides are long checklists you follow manually. Most scripts 
 
 - **Idempotent** — checks current state before every action. Safe to re-run anytime.
 - **Dry-run mode** — preview every change before applying. Nothing is modified until you're ready.
-- **Modular** — run all 14 modules or pick only what you need with `--skip` and `--only`.
+- **Modular** — run all 18 modules or pick only what you need with `--skip` and `--only`.
 - **Lockout protection** — validates SSH config, keys, firewall rules, and AllowUsers before restarting. Auto-rolls back on failure.
 - **Interactive or CLI** — setup wizard for first runs, fully non-interactive CLI for automation.
 - **Single file, zero dependencies** — just Bash. No Python, no Ansible, no agents.
@@ -74,7 +74,7 @@ sudo vps-harden --username deploy \
 
 ## What It Does
 
-14 modules run in order. Each is idempotent — safe to re-run.
+18 modules run in order. Each is idempotent — safe to re-run. The first 14 are OS-level hardening; the last 4 are agent-specific and require `--agent-dir`.
 
 | Module | What it does | Why |
 |--------|-------------|-----|
@@ -91,6 +91,10 @@ sudo vps-harden --username deploy \
 | `monitoring` | Installs auditd + logwatch, deploys audit rules, installs [`server-report`](#server-report) | You can't protect what you can't see |
 | `shell` | umask 027, bash history with timestamps, plaintext secret scanning | Prevents accidental world-readable files, aids forensics |
 | `misc` | Timezone, hostname, lock root password, restrict `su` | Locks down remaining escalation paths |
+| `agent_secrets` | Scans agent workspace for plaintext secrets, checks SOPS encryption, deploys helper | API keys in config files are the #1 agent security risk |
+| `agent_webhook_auth` | Verifies webhook listener, UFW rules, TLS proxy, auth, rate limiting | Webhooks are unauthenticated HTTP endpoints by default |
+| `agent_logging` | Creates log directory, logrotate, append-only flags, auditd rules | Tamper-evident logs for agent actions and API calls |
+| `agent_data` | Checks data directory permissions, gitignore, git history, encryption | Health data, user data, and PII need restricted access |
 | `verify` | Runs all checks, prints security scorecard | Single view of your security posture |
 
 ---
@@ -140,8 +144,15 @@ The `verify` module prints a grouped scorecard at the end of every run. Section 
   [PASS] Root password locked
   [PASS] No plaintext secrets in .bashrc
   [PASS] authorized_keys permissions 600
+
+  ── Agent Security — AI agent workspace hardening ──
+  [PASS] No plaintext secrets in agent workspace
+  [PASS] SOPS-encrypted secrets file present
+  [PASS] Webhook listener active on port 5000
+  [PASS] Agent logs directory exists (750)
+  [PASS] Data directory permissions 700 (owner-only)
 --------------------------------------------------------------------
-  SCORE: 24 PASSED | 1 WARNING | 0 FAILED
+  SCORE: 29 PASSED | 1 WARNING | 0 FAILED
 --------------------------------------------------------------------
 ```
 
@@ -189,6 +200,9 @@ All output is plain text — no colors, no control codes. Safe for piping, loggi
 | `--hostname NAME` | No | Set system hostname |
 | `--auto-reboot` | No | Enable automatic reboot after kernel updates |
 | `--openclaw-skill` | No | Add `server-report` skill to an OpenClaw bot |
+| `--agent-dir DIR` | No | AI agent workspace directory (enables agent modules) |
+| `--webhook-port PORT` | No | Webhook listener port (default: `5000`) |
+| `--agent-data-dir DIR` | No | Sensitive data directory to protect |
 | `--skip MOD[,MOD]` | No | Comma-separated modules to skip |
 | `--only MOD[,MOD]` | No | Run only specified modules |
 | `--dry-run` | No | Preview changes without applying them |
@@ -233,8 +247,8 @@ If something goes wrong, your current SSH session stays alive and the config is 
 | Ubuntu | 24.04 LTS | Tested |
 | Ubuntu | 22.04 LTS | Tested |
 | Ubuntu | 20.04 LTS | Tested |
-| Debian | 12 (Bookworm) | Supported |
-| Debian | 11 (Bullseye) | Supported |
+| Debian | 12 (Bookworm) | Untested (should work) |
+| Debian | 11 (Bullseye) | Untested (should work) |
 
 **Architecture:** amd64, arm64
 

@@ -5,10 +5,10 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly SCRIPT_VERSION="1.3.5"
+readonly SCRIPT_VERSION="1.4.0"
 LOG_FILE="/var/log/vps-harden-$(date +%Y%m%d-%H%M%S).log"
 readonly LOG_FILE
-readonly ALL_MODULES="prereqs user ssh firewall fail2ban sysctl netbird firewall_tighten sops upgrades monitoring shell misc verify"
+readonly ALL_MODULES="prereqs user ssh firewall fail2ban sysctl netbird firewall_tighten sops upgrades monitoring shell misc agent_secrets agent_webhook_auth agent_logging agent_data verify"
 readonly SOPS_FALLBACK_VERSION="3.9.4"
 
 # ── Color output ─────────────────────────────────────────────────────────────
@@ -35,9 +35,9 @@ sc_add() {
     SC_RESULTS+=("$result")
     SC_HINTS+=("$hint")
     case "$result" in
-        PASS) ((SC_PASS++)) ;;
-        WARN) ((SC_WARN++)) ;;
-        FAIL) ((SC_FAIL++)) ;;
+        PASS) ((SC_PASS++)) || true ;;
+        WARN) ((SC_WARN++)) || true ;;
+        FAIL) ((SC_FAIL++)) || true ;;
     esac
 }
 
@@ -137,6 +137,9 @@ DRY_RUN="false"
 INTERACTIVE="false"
 CONFIG_FILE=""
 SSH_KEY_CONTENT=""
+AGENT_DIR=""
+WEBHOOK_PORT="5000"
+AGENT_DATA_DIR=""
 
 # ── Distro detection ────────────────────────────────────────────────────────
 check_distro() {
@@ -198,6 +201,9 @@ Optional:
   --hostname NAME        Set hostname
   --auto-reboot          Enable auto-reboot for kernel updates
   --openclaw-skill       Add server-report skill to OpenClaw bot
+  --agent-dir DIR        AI agent workspace directory (enables agent modules)
+  --webhook-port PORT    Webhook listener port (default: 5000)
+  --agent-data-dir DIR   Sensitive data directory to protect (e.g. health data)
   --skip MOD[,MOD]       Comma-separated modules to skip
   --only MOD[,MOD]       Only run specified modules (comma-separated)
   --dry-run              Show what would change, change nothing
@@ -209,7 +215,9 @@ Optional:
 
 Modules (execution order):
   prereqs user ssh firewall fail2ban sysctl netbird firewall_tighten
-  sops upgrades monitoring shell misc verify
+  sops upgrades monitoring shell misc
+  agent_secrets agent_webhook_auth agent_logging agent_data  (need --agent-dir)
+  verify
 
 Examples:
   # Interactive wizard (recommended for first run):
@@ -251,6 +259,9 @@ parse_config_file() {
             hostname)       SET_HOSTNAME="$value" ;;
             auto_reboot)    AUTO_REBOOT="$value" ;;
             openclaw_skill) OPENCLAW_SKILL="$value" ;;
+            agent_dir)      AGENT_DIR="$value" ;;
+            webhook_port)   WEBHOOK_PORT="$value" ;;
+            agent_data_dir) AGENT_DATA_DIR="$value" ;;
             skip)           SKIP_MODULES="$value" ;;
             only)           ONLY_MODULES="$value" ;;
         esac
@@ -268,6 +279,9 @@ parse_args() {
             --hostname)       SET_HOSTNAME="$2"; shift 2 ;;
             --auto-reboot)    AUTO_REBOOT="true"; shift ;;
             --openclaw-skill) OPENCLAW_SKILL="true"; shift ;;
+            --agent-dir)      AGENT_DIR="$2"; shift 2 ;;
+            --webhook-port)   WEBHOOK_PORT="$2"; shift 2 ;;
+            --agent-data-dir) AGENT_DATA_DIR="$2"; shift 2 ;;
             --skip)           SKIP_MODULES="$2"; shift 2 ;;
             --only)           ONLY_MODULES="$2"; shift 2 ;;
             --interactive)    INTERACTIVE="true"; shift ;;
@@ -306,6 +320,19 @@ should_run() {
     fi
     if [[ -n "$SKIP_MODULES" ]]; then
         echo ",$SKIP_MODULES," | grep -q ",$mod," && return 1 || return 0
+    fi
+    return 0
+}
+
+# ── Agent module gate ──────────────────────────────────────────────────────
+require_agent_dir() {
+    if [[ -z "$AGENT_DIR" ]]; then
+        log_info "No --agent-dir provided, skipping agent module"
+        return 1
+    fi
+    if [[ ! -d "$AGENT_DIR" ]]; then
+        log_warn "Agent directory $AGENT_DIR does not exist, skipping agent module"
+        return 1
     fi
     return 0
 }
@@ -1233,6 +1260,588 @@ mod_misc() {
     fi
 }
 
+# ── Module: agent_secrets — Scan for plaintext secrets ────────────────────────
+mod_agent_secrets() {
+    log_header "Module: agent_secrets"
+    require_agent_dir || return 0
+
+    local found_plaintext=false
+    local has_env_exposed=false
+    local has_sops_file=false
+    local gitignore_ok=false
+    local git_history_clean=true
+
+    # 1. Scan config/code files for API key patterns
+    log_info "Scanning $AGENT_DIR for plaintext secrets..."
+    local secret_pattern='(sk-[a-zA-Z0-9_-]{20,}|sk-ant-[a-zA-Z0-9_-]{20,}|anthropic-[a-zA-Z0-9_-]{10,}|Bearer [a-zA-Z0-9_-]{20,}|api[_-]?key\s*[:=]\s*["\x27]?[a-zA-Z0-9_-]{20,})'
+    while IFS= read -r -d '' f; do
+        if grep -qEi "$secret_pattern" "$f" 2>/dev/null; then
+            log_warn "Possible plaintext secret in: $f"
+            found_plaintext=true
+        fi
+    done < <(find "$AGENT_DIR" -maxdepth 3 -type f \( -name "*.json" -o -name "*.yaml" -o -name "*.yml" -o -name "*.sh" -o -name "*.py" -o -name "*.conf" -o -name "*.toml" \) ! -path "*/node_modules/*" ! -path "*/.git/*" ! -name "*.enc.*" -print0 2>/dev/null)
+
+    if [[ "$found_plaintext" == "false" ]]; then
+        log_info "No plaintext secrets detected in config/code files"
+    fi
+
+    # 2. Check .env files for exposed secrets
+    while IFS= read -r -d '' envfile; do
+        local envperms
+        envperms=$(stat -c %a "$envfile" 2>/dev/null || echo "unknown")
+        if [[ "$envperms" != "600" && "$envperms" != "400" ]]; then
+            log_warn ".env file has loose permissions ($envperms): $envfile"
+            has_env_exposed=true
+            if [[ "$DRY_RUN" != "true" ]]; then
+                chmod 600 "$envfile"
+                log_info "Fixed permissions on $envfile to 600"
+            else
+                log_dry "chmod 600 $envfile"
+            fi
+        fi
+    done < <(find "$AGENT_DIR" -maxdepth 3 -type f \( -name ".env" -o -name "*.env" \) ! -name "*.enc.*" -print0 2>/dev/null)
+
+    # 3. Check for SOPS-encrypted secrets file
+    if find "$AGENT_DIR" -maxdepth 3 -type f \( -name "*.enc.env" -o -name "*.enc.json" -o -name "*.enc.yaml" \) 2>/dev/null | grep -q .; then
+        has_sops_file=true
+        log_info "SOPS-encrypted secrets file found"
+    else
+        log_warn "No SOPS-encrypted secrets file found — consider encrypting credentials"
+    fi
+
+    # 4. Check .gitignore covers secret patterns
+    local gitignore_file="$AGENT_DIR/.gitignore"
+    if [[ -f "$gitignore_file" ]]; then
+        local covered=0
+        for pattern in ".env" "*.enc.*" "auth-profiles.json" "secrets"; do
+            if grep -qF "$pattern" "$gitignore_file" 2>/dev/null; then
+                ((covered++))
+            fi
+        done
+        if [[ $covered -ge 2 ]]; then
+            gitignore_ok=true
+            log_info ".gitignore covers secret patterns ($covered/4 patterns found)"
+        else
+            log_warn ".gitignore only covers $covered/4 common secret patterns"
+        fi
+    else
+        log_info "No .gitignore in $AGENT_DIR (not a git repo or no ignore file)"
+        gitignore_ok=true  # not a git repo, not a concern
+    fi
+
+    # 5. Limited git history scan for leaked secrets
+    if [[ -d "$AGENT_DIR/.git" ]]; then
+        log_info "Scanning last 50 commits for leaked secrets..."
+        local leaked
+        leaked=$(cd "$AGENT_DIR" && git log --oneline -50 --diff-filter=A --name-only 2>/dev/null \
+            | grep -Ei '(secret|credential|key|token|password|\.env$)' \
+            | grep -v ".enc." | head -5 || true)
+        if [[ -n "$leaked" ]]; then
+            git_history_clean=false
+            log_warn "Potential secret files found in git history:"
+            echo "$leaked" | while IFS= read -r line; do
+                log_warn "  $line"
+            done
+        else
+            log_info "No obvious secret files in recent git history"
+        fi
+    fi
+
+    # 6. Deploy load-secrets.sh helper if missing
+    local helper="$AGENT_DIR/scripts/load-secrets.sh"
+    if [[ ! -f "$helper" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_dry "Deploy load-secrets.sh helper to $helper"
+        else
+            mkdir -p "$(dirname "$helper")"
+            cat > "$helper" <<'HELPEREOF'
+#!/usr/bin/env bash
+# load-secrets.sh — Decrypt SOPS secrets into environment variables
+# Usage: source load-secrets.sh [secrets-file]
+# Default: looks for secrets.enc.env in the same directory as this script
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SECRETS_FILE="${1:-$(find "$SCRIPT_DIR/.." -maxdepth 1 -name '*.enc.env' -print -quit 2>/dev/null)}"
+if [[ -z "$SECRETS_FILE" || ! -f "$SECRETS_FILE" ]]; then
+    echo "No encrypted secrets file found" >&2
+    exit 1
+fi
+if ! command -v sops &>/dev/null; then
+    echo "sops not installed — run vps-harden to install it" >&2
+    exit 1
+fi
+eval "$(sops -d --output-type dotenv "$SECRETS_FILE" 2>/dev/null)"
+echo "Loaded secrets from $SECRETS_FILE"
+HELPEREOF
+            chmod 750 "$helper"
+            chown "${USERNAME}:${USERNAME}" "$helper"
+            log_info "Deployed load-secrets.sh helper to $helper"
+        fi
+    else
+        log_info "load-secrets.sh helper already exists"
+    fi
+
+    # Scorecard
+    if [[ "$found_plaintext" == "true" ]]; then
+        sc_add "FAIL" "Plaintext secrets found in agent config files" "encrypt with SOPS"
+    else
+        sc_add "PASS" "No plaintext secrets in agent config files"
+    fi
+
+    if [[ "$has_env_exposed" == "true" ]]; then
+        sc_add "WARN" ".env files had loose permissions (fixed)" ""
+    else
+        sc_add "PASS" ".env file permissions OK (600)"
+    fi
+
+    if [[ "$has_sops_file" == "true" ]]; then
+        sc_add "PASS" "SOPS-encrypted secrets file present"
+    else
+        sc_add "WARN" "No SOPS-encrypted secrets file" "encrypt credentials with sops"
+    fi
+
+    if [[ "$gitignore_ok" == "true" ]]; then
+        sc_add "PASS" ".gitignore covers secret patterns"
+    else
+        sc_add "WARN" ".gitignore missing common secret patterns" "add .env, *.enc.* patterns"
+    fi
+
+    if [[ "$git_history_clean" == "true" ]]; then
+        sc_add "PASS" "No secrets detected in recent git history"
+    else
+        sc_add "WARN" "Potential secret files in git history" "consider git filter-repo"
+    fi
+}
+
+# ── Module: agent_webhook_auth — Verify webhook security ─────────────────────
+mod_agent_webhook_auth() {
+    log_header "Module: agent_webhook_auth"
+    require_agent_dir || return 0
+
+    local port="$WEBHOOK_PORT"
+    local listener_found=false
+    local ufw_safe=true
+    local has_tls_proxy=false
+    local has_sig_verify=false
+    local has_rate_limit=false
+
+    # 1. Check process listening on WEBHOOK_PORT
+    log_info "Checking for listener on port $port..."
+    local listener
+    listener=$(ss -tlnp "sport = :$port" 2>/dev/null | tail -n +2 || true)
+    if [[ -n "$listener" ]]; then
+        listener_found=true
+        local proc_name
+        proc_name=$(echo "$listener" | grep -oP 'users:\(\("\K[^"]+' | head -1 || echo "unknown")
+        log_info "Found listener on port $port: $proc_name"
+    else
+        log_info "No process listening on port $port"
+    fi
+
+    # 2. Check UFW doesn't expose webhook port to 0.0.0.0
+    if command -v ufw &>/dev/null && ufw status | grep -q "^Status: active"; then
+        if ufw status | grep -E "$port/(tcp|udp)" | grep -q "Anywhere"; then
+            ufw_safe=false
+            log_warn "UFW exposes port $port to the internet"
+        else
+            log_info "Port $port not exposed via UFW (good)"
+        fi
+    fi
+
+    # 3. Check for reverse proxy with TLS (Caddy or Nginx)
+    log_info "Checking for TLS reverse proxy..."
+    if command -v caddy &>/dev/null; then
+        local caddyfile="/etc/caddy/Caddyfile"
+        if [[ -f "$caddyfile" ]] && grep -q "reverse_proxy.*localhost:$port\|reverse_proxy.*127.0.0.1:$port" "$caddyfile" 2>/dev/null; then
+            has_tls_proxy=true
+            log_info "Caddy reverse proxy found for port $port (auto-TLS)"
+        fi
+    fi
+    if [[ "$has_tls_proxy" == "false" ]] && command -v nginx &>/dev/null; then
+        if grep -rq "proxy_pass.*localhost:$port\|proxy_pass.*127.0.0.1:$port" /etc/nginx/ 2>/dev/null; then
+            has_tls_proxy=true
+            log_info "Nginx reverse proxy found for port $port"
+        fi
+    fi
+    if [[ "$has_tls_proxy" == "false" ]]; then
+        log_warn "No TLS reverse proxy detected for port $port"
+    fi
+
+    # 4. Heuristic scan for signature verification in Python code
+    log_info "Scanning for webhook signature verification..."
+    if find "$AGENT_DIR" -maxdepth 3 -type f -name "*.py" ! -path "*/node_modules/*" ! -path "*/.git/*" -print0 2>/dev/null \
+        | xargs -0 grep -lEi '(hmac|X-Hub-Signature|verify_signature|webhook.*secret|auth.*token.*header|Bearer.*check)' 2>/dev/null | grep -q .; then
+        has_sig_verify=true
+        log_info "Webhook signature/auth verification found in Python code"
+    else
+        log_warn "No webhook signature verification detected in agent code"
+    fi
+
+    # 5. Heuristic scan for rate limiting
+    log_info "Scanning for rate limiting..."
+    # Check Python code
+    if find "$AGENT_DIR" -maxdepth 3 -type f -name "*.py" ! -path "*/node_modules/*" ! -path "*/.git/*" -print0 2>/dev/null \
+        | xargs -0 grep -lEi '(flask.limiter|slowapi|ratelimit|rate_limit|throttle)' 2>/dev/null | grep -q .; then
+        has_rate_limit=true
+        log_info "Rate limiting found in Python code"
+    fi
+    # Check Caddy config
+    if [[ "$has_rate_limit" == "false" ]] && [[ -f "/etc/caddy/Caddyfile" ]]; then
+        if grep -qi "rate_limit" /etc/caddy/Caddyfile 2>/dev/null; then
+            has_rate_limit=true
+            log_info "Rate limiting configured in Caddy"
+        fi
+    fi
+    if [[ "$has_rate_limit" == "false" ]]; then
+        log_warn "No rate limiting detected for webhook endpoint"
+    fi
+
+    # Scorecard
+    if [[ "$listener_found" == "true" ]]; then
+        sc_add "PASS" "Webhook listener active on port $port"
+    else
+        sc_add "WARN" "No webhook listener on port $port" "is the service running?"
+    fi
+
+    if [[ "$ufw_safe" == "true" ]]; then
+        sc_add "PASS" "Webhook port $port not publicly exposed via UFW"
+    else
+        sc_add "FAIL" "Webhook port $port exposed to internet via UFW" "remove broad rule"
+    fi
+
+    if [[ "$has_tls_proxy" == "true" ]]; then
+        sc_add "PASS" "TLS reverse proxy in front of webhook"
+    else
+        sc_add "WARN" "No TLS reverse proxy for webhook" "add Caddy/Nginx"
+    fi
+
+    if [[ "$has_sig_verify" == "true" ]]; then
+        sc_add "PASS" "Webhook signature/auth verification present"
+    else
+        sc_add "WARN" "No webhook auth/signature verification detected" "add HMAC or token auth"
+    fi
+
+    if [[ "$has_rate_limit" == "true" ]]; then
+        sc_add "PASS" "Rate limiting configured for webhook"
+    else
+        sc_add "WARN" "No rate limiting for webhook endpoint" "add flask-limiter or Caddy rate_limit"
+    fi
+}
+
+# ── Module: agent_logging — Structured agent logging ─────────────────────────
+mod_agent_logging() {
+    log_header "Module: agent_logging"
+    require_agent_dir || return 0
+
+    local logs_dir="$AGENT_DIR/logs"
+    local logs_ok=false
+    local logrotate_ok=false
+    local append_only_ok=false
+    local auditd_ok=false
+
+    # 1. Create/verify logs directory with 750 permissions
+    if [[ -d "$logs_dir" ]]; then
+        local dir_perms
+        dir_perms=$(stat -c %a "$logs_dir" 2>/dev/null || echo "unknown")
+        if [[ "$dir_perms" == "750" ]]; then
+            logs_ok=true
+            log_info "Logs directory exists with correct permissions (750)"
+        else
+            log_warn "Logs directory permissions are $dir_perms (should be 750)"
+            if [[ "$DRY_RUN" == "true" ]]; then
+                log_dry "chmod 750 $logs_dir"
+            else
+                chmod 750 "$logs_dir"
+                logs_ok=true
+                log_info "Fixed logs directory permissions to 750"
+            fi
+        fi
+    else
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_dry "mkdir -p $logs_dir && chmod 750"
+        else
+            mkdir -p "$logs_dir"
+            chmod 750 "$logs_dir"
+            chown "${USERNAME}:${USERNAME}" "$logs_dir"
+            logs_ok=true
+            log_info "Created logs directory at $logs_dir (750)"
+        fi
+    fi
+
+    # 2. Deploy logrotate config
+    local logrotate_conf="/etc/logrotate.d/agent-logs"
+    local desired_logrotate
+    desired_logrotate=$(cat <<LREOF
+# vps-harden.sh — agent log rotation
+${logs_dir}/*.log {
+    daily
+    rotate 90
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 640 ${USERNAME} ${USERNAME}
+}
+LREOF
+)
+
+    if [[ -f "$logrotate_conf" ]] && diff -q <(echo "$desired_logrotate") "$logrotate_conf" &>/dev/null; then
+        logrotate_ok=true
+        log_info "Logrotate config already correct"
+    else
+        echo "$desired_logrotate" | write_file "$logrotate_conf" 644
+        logrotate_ok=true
+    fi
+
+    # 3. Set chattr +a (append-only) on active log files
+    local log_files
+    log_files=$(find "$logs_dir" -maxdepth 1 -name "*.log" -type f 2>/dev/null || true)
+    if [[ -n "$log_files" ]]; then
+        local chattr_failed=false
+        while IFS= read -r logfile; do
+            if [[ "$DRY_RUN" == "true" ]]; then
+                log_dry "chattr +a $logfile"
+            else
+                if chattr +a "$logfile" 2>/dev/null; then
+                    log_info "Set append-only on $logfile"
+                else
+                    chattr_failed=true
+                fi
+            fi
+        done <<< "$log_files"
+        if [[ "$chattr_failed" == "true" ]]; then
+            log_warn "chattr +a not supported on this filesystem (graceful skip)"
+            append_only_ok=false
+        else
+            append_only_ok=true
+        fi
+    else
+        log_info "No active log files to set append-only on"
+        append_only_ok=true  # nothing to do is OK
+    fi
+
+    # 4. Deploy logging-config.json template
+    local logging_conf="$AGENT_DIR/logging-config.json"
+    if [[ ! -f "$logging_conf" ]]; then
+        local desired_logging
+        desired_logging=$(cat <<LJEOF
+{
+  "version": 1,
+  "disable_existing_loggers": false,
+  "formatters": {
+    "json": {
+      "class": "pythonjsonlogger.jsonlogger.JsonFormatter",
+      "format": "%(asctime)s %(name)s %(levelname)s %(message)s %(funcName)s %(lineno)d"
+    }
+  },
+  "handlers": {
+    "file": {
+      "class": "logging.handlers.RotatingFileHandler",
+      "filename": "${logs_dir}/agent.log",
+      "maxBytes": 10485760,
+      "backupCount": 5,
+      "formatter": "json"
+    }
+  },
+  "root": {
+    "level": "INFO",
+    "handlers": ["file"]
+  }
+}
+LJEOF
+)
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_dry "Deploy logging-config.json to $logging_conf"
+        else
+            echo "$desired_logging" > "$logging_conf"
+            chmod 644 "$logging_conf"
+            chown "${USERNAME}:${USERNAME}" "$logging_conf"
+            log_info "Deployed logging-config.json template"
+        fi
+    else
+        log_info "logging-config.json already exists"
+    fi
+
+    # 5. Deploy auditd rules for agent paths
+    local audit_rules="/etc/audit/rules.d/agent-harden.rules"
+    local desired_audit
+    desired_audit=$(cat <<AAEOF
+## vps-harden.sh — agent workspace audit rules
+
+# Agent config changes
+-w ${AGENT_DIR} -p wa -k agent_config
+
+# Agent logs (detect tampering)
+-w ${logs_dir} -p wa -k agent_logs
+AAEOF
+)
+
+    if [[ -f "$audit_rules" ]] && diff -q <(echo "$desired_audit") "$audit_rules" &>/dev/null; then
+        auditd_ok=true
+        log_info "Agent audit rules already correct"
+    else
+        echo "$desired_audit" | write_file "$audit_rules" 640
+        auditd_ok=true
+        if [[ "$DRY_RUN" != "true" ]]; then
+            if command -v augenrules &>/dev/null; then
+                run_cmd augenrules --load
+                log_info "Reloaded audit rules"
+            fi
+        fi
+    fi
+
+    # Scorecard
+    if [[ "$logs_ok" == "true" ]]; then
+        sc_add "PASS" "Agent logs directory exists (750)"
+    else
+        sc_add "WARN" "Agent logs directory needs setup" "will fix on real run"
+    fi
+
+    if [[ "$logrotate_ok" == "true" ]]; then
+        sc_add "PASS" "Agent log rotation configured (90 days)"
+    else
+        sc_add "WARN" "Agent log rotation not configured" "will fix"
+    fi
+
+    if [[ "$append_only_ok" == "true" ]]; then
+        sc_add "PASS" "Active log files are append-only"
+    else
+        sc_add "WARN" "chattr +a not supported on this filesystem" "consider ext4"
+    fi
+
+    if [[ "$auditd_ok" == "true" ]]; then
+        sc_add "PASS" "Auditd rules for agent workspace deployed"
+    else
+        sc_add "WARN" "Agent auditd rules not deployed" "will fix"
+    fi
+}
+
+# ── Module: agent_data — Protect sensitive data directories ──────────────────
+mod_agent_data() {
+    log_header "Module: agent_data"
+    require_agent_dir || return 0
+
+    if [[ -z "$AGENT_DATA_DIR" ]]; then
+        log_info "No --agent-data-dir provided, skipping data protection module"
+        return 0
+    fi
+
+    if [[ ! -d "$AGENT_DATA_DIR" ]]; then
+        log_warn "Agent data directory $AGENT_DATA_DIR does not exist, skipping"
+        return 0
+    fi
+
+    local perms_ok=false
+    local gitignore_ok=false
+    local git_history_clean=true
+    local unencrypted_warn=false
+
+    # 1. Check/fix directory permissions to 700
+    local dir_perms
+    dir_perms=$(stat -c %a "$AGENT_DATA_DIR" 2>/dev/null || echo "unknown")
+    if [[ "$dir_perms" == "700" ]]; then
+        perms_ok=true
+        log_info "Data directory permissions are 700 (owner-only)"
+    else
+        log_warn "Data directory permissions are $dir_perms (should be 700)"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_dry "chmod 700 $AGENT_DATA_DIR"
+        else
+            chmod 700 "$AGENT_DATA_DIR"
+            perms_ok=true
+            log_info "Fixed data directory permissions to 700"
+        fi
+    fi
+
+    # Also check subdirectories
+    while IFS= read -r -d '' subdir; do
+        local sub_perms
+        sub_perms=$(stat -c %a "$subdir" 2>/dev/null || echo "unknown")
+        if [[ "$sub_perms" != "700" && "$sub_perms" != "750" ]]; then
+            log_warn "Subdirectory $subdir has permissions $sub_perms"
+            if [[ "$DRY_RUN" == "true" ]]; then
+                log_dry "chmod 700 $subdir"
+            else
+                chmod 700 "$subdir"
+                log_info "Fixed permissions on $subdir"
+            fi
+        fi
+    done < <(find "$AGENT_DATA_DIR" -maxdepth 2 -type d -print0 2>/dev/null)
+
+    # 2. Check .gitignore covers data patterns
+    local agent_gitignore="$AGENT_DIR/.gitignore"
+    if [[ -f "$agent_gitignore" ]]; then
+        local covered=0
+        for pattern in "*.csv" "*.jsonl" "data/" "raw/" "*.db" "*.sqlite"; do
+            if grep -qF "$pattern" "$agent_gitignore" 2>/dev/null; then
+                ((covered++))
+            fi
+        done
+        if [[ $covered -ge 2 ]]; then
+            gitignore_ok=true
+            log_info ".gitignore covers data patterns ($covered/6 common patterns)"
+        else
+            log_warn ".gitignore only covers $covered/6 common data patterns"
+        fi
+    else
+        log_info "No .gitignore in agent dir (not a git repo)"
+        gitignore_ok=true
+    fi
+
+    # 3. Scan git history for data file additions
+    if [[ -d "$AGENT_DIR/.git" ]]; then
+        log_info "Scanning last 20 commits for accidentally committed data files..."
+        local data_files
+        data_files=$(cd "$AGENT_DIR" && git log --oneline -20 --diff-filter=A --name-only 2>/dev/null \
+            | grep -Ei '\.(csv|jsonl|db|sqlite|parquet|xlsx)$' | head -5 || true)
+        if [[ -n "$data_files" ]]; then
+            git_history_clean=false
+            log_warn "Data files found in git history:"
+            echo "$data_files" | while IFS= read -r line; do
+                log_warn "  $line"
+            done
+        else
+            log_info "No data files in recent git history"
+        fi
+    fi
+
+    # 4. Check for unencrypted sensitive data files (advisory only)
+    local sensitive_count
+    sensitive_count=$(find "$AGENT_DATA_DIR" -maxdepth 3 -type f \( -name "*.csv" -o -name "*.jsonl" -o -name "*.json" -o -name "*.db" -o -name "*.sqlite" \) ! -name "*.enc.*" 2>/dev/null | wc -l || echo "0")
+    if [[ "$sensitive_count" -gt 0 ]]; then
+        unencrypted_warn=true
+        log_warn "$sensitive_count unencrypted data file(s) in $AGENT_DATA_DIR"
+        log_info "Consider encrypting sensitive data at rest with SOPS or GPG"
+    else
+        log_info "No unencrypted data files detected"
+    fi
+
+    # Scorecard
+    if [[ "$perms_ok" == "true" ]]; then
+        sc_add "PASS" "Data directory permissions 700 (owner-only)"
+    else
+        sc_add "WARN" "Data directory permissions need fixing" "will fix on real run"
+    fi
+
+    if [[ "$gitignore_ok" == "true" ]]; then
+        sc_add "PASS" ".gitignore covers data file patterns"
+    else
+        sc_add "WARN" ".gitignore missing data file patterns" "add *.csv, *.jsonl, data/"
+    fi
+
+    if [[ "$git_history_clean" == "true" ]]; then
+        sc_add "PASS" "No data files in recent git history"
+    else
+        sc_add "WARN" "Data files found in git history" "consider git filter-repo"
+    fi
+
+    if [[ "$unencrypted_warn" == "true" ]]; then
+        sc_add "WARN" "$sensitive_count unencrypted data files in data dir" "consider encrypting at rest"
+    else
+        sc_add "PASS" "No unencrypted data files detected"
+    fi
+}
+
 # ── Module: verify ───────────────────────────────────────────────────────────
 mod_verify() {
     log_header "Module: verify — Security Scorecard"
@@ -1423,6 +2032,61 @@ mod_verify() {
         fi
     fi
 
+    # ── Agent Security (only when --agent-dir is set) ──────────────────
+    if [[ -n "$AGENT_DIR" && -d "$AGENT_DIR" ]]; then
+        sc_add "SECTION" "Agent Security — AI agent workspace hardening"
+
+        # Secrets check
+        local agent_secrets_found=false
+        if find "$AGENT_DIR" -maxdepth 3 -type f \( -name "*.json" -o -name "*.yaml" -o -name "*.yml" -o -name "*.conf" \) ! -name "*.enc.*" ! -path "*/.git/*" ! -path "*/node_modules/*" -print0 2>/dev/null \
+            | xargs -0 grep -lEi '(sk-[a-zA-Z0-9_-]{20,}|api[_-]?key\s*[:=]\s*["\x27]?[a-zA-Z0-9_-]{20,})' 2>/dev/null | grep -q .; then
+            agent_secrets_found=true
+        fi
+        if [[ "$agent_secrets_found" == "true" ]]; then
+            sc_add "FAIL" "Plaintext secrets in agent workspace" "run agent_secrets module"
+        else
+            sc_add "PASS" "No plaintext secrets in agent workspace"
+        fi
+
+        # SOPS encrypted file
+        if find "$AGENT_DIR" -maxdepth 3 -type f \( -name "*.enc.env" -o -name "*.enc.json" -o -name "*.enc.yaml" \) 2>/dev/null | grep -q .; then
+            sc_add "PASS" "SOPS-encrypted secrets file present"
+        else
+            sc_add "WARN" "No SOPS-encrypted secrets file in agent dir" "encrypt credentials"
+        fi
+
+        # Webhook check
+        if ss -tlnp "sport = :$WEBHOOK_PORT" 2>/dev/null | tail -n +2 | grep -q .; then
+            sc_add "PASS" "Webhook listener active on port $WEBHOOK_PORT"
+        else
+            sc_add "WARN" "No webhook listener on port $WEBHOOK_PORT" "is the agent running?"
+        fi
+
+        # Agent logs directory
+        if [[ -d "$AGENT_DIR/logs" ]]; then
+            local agent_log_perms
+            agent_log_perms=$(stat -c %a "$AGENT_DIR/logs" 2>/dev/null || echo "unknown")
+            if [[ "$agent_log_perms" == "750" ]]; then
+                sc_add "PASS" "Agent logs directory exists (750)"
+            else
+                sc_add "WARN" "Agent logs directory permissions $agent_log_perms" "run agent_logging module"
+            fi
+        else
+            sc_add "WARN" "No agent logs directory" "run agent_logging module"
+        fi
+
+        # Data directory check (only if --agent-data-dir is set)
+        if [[ -n "$AGENT_DATA_DIR" && -d "$AGENT_DATA_DIR" ]]; then
+            local data_perms
+            data_perms=$(stat -c %a "$AGENT_DATA_DIR" 2>/dev/null || echo "unknown")
+            if [[ "$data_perms" == "700" ]]; then
+                sc_add "PASS" "Data directory permissions 700 (owner-only)"
+            else
+                sc_add "WARN" "Data directory permissions $data_perms (should be 700)" "run agent_data module"
+            fi
+        fi
+    fi
+
     # ── Print scorecard ──────────────────────────────────────────────────
     echo ""
     echo -e "${BOLD}====================================================================${NC}"
@@ -1565,6 +2229,9 @@ build_rerun_cmd() {
     [[ -n "$SSH_SAFETY_IP" ]] && cmd+=" --ssh-safety-ip ${SSH_SAFETY_IP}"
     [[ -n "$TIMEZONE" ]] && cmd+=" --timezone ${TIMEZONE}"
     [[ -n "$NETBIRD_KEY" ]] && cmd+=" --netbird-key ${NETBIRD_KEY}"
+    [[ -n "$AGENT_DIR" ]] && cmd+=" --agent-dir ${AGENT_DIR}"
+    [[ "$WEBHOOK_PORT" != "5000" ]] && cmd+=" --webhook-port ${WEBHOOK_PORT}"
+    [[ -n "$AGENT_DATA_DIR" ]] && cmd+=" --agent-data-dir ${AGENT_DATA_DIR}"
     [[ "$include_dry_run" == "true" ]] && cmd+=" --dry-run"
     echo "$cmd"
 }
