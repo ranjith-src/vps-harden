@@ -19,7 +19,7 @@ Thanks for your interest in contributing! This project is intentionally simple �
 - Use `bash -n` to verify syntax.
 - Follow the existing patterns — look at how other modules are structured before adding new ones.
 - Keep functions focused. One module = one security concern.
-- Use `log_info`, `log_warn`, `log_ok`, and `die` for output — don't write directly to stdout.
+- Use `log_info`, `log_warn`, `log_fail`, and `die` for output — don't write directly to stdout.
 - Support `--dry-run` in every module by checking `$DRY_RUN` and using `run_cmd` / `write_file`.
 
 ### Modules
@@ -28,21 +28,21 @@ Each module follows this pattern:
 
 ```bash
 mod_example() {
-    log_info "Description of what this module does"
+    log_header "Module: example"
 
     # Check current state before changing anything (idempotent)
     if [[ -f /etc/example.conf ]]; then
-        log_ok "Already configured"
+        log_info "Already configured"
         return 0
     fi
 
     # Use run_cmd for commands, write_file for file creation
-    run_cmd "Install example" apt-get install -y -qq example
+    run_cmd apt-get install -y -qq example
     write_file "/etc/example.conf" "644" <<'CONF'
 # config content here
 CONF
 
-    log_ok "Example configured"
+    log_info "Example configured"
 }
 ```
 
@@ -55,7 +55,7 @@ Key rules:
 ### Adding a new module
 
 1. Add your function `mod_yourmodule()` in the appropriate position in the script
-2. Add `yourmodule` to the `ALL_MODULES` array
+2. Add `yourmodule` to the `ALL_MODULES` list
 3. Add it to `usage()` module list
 4. Add verification checks to `mod_verify()`
 5. Update the module table in `README.md`
@@ -68,9 +68,9 @@ Every module should have corresponding checks in `mod_verify()`:
 ```bash
 # In mod_verify()
 if systemctl is-active --quiet example; then
-    score_pass "example service active"
+    sc_add "PASS" "example service active"
 else
-    score_fail "example service not running"
+    sc_add "FAIL" "example service not running" "will fix"
 fi
 ```
 
