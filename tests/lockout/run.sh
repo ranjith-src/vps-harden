@@ -622,10 +622,15 @@ scenario_the_opposite_setting_is_not_mistaken_for_it() {
 # Modules run on the left of ||, so errexit is off inside them and only explicit checks stop them.
 scenario_failed_key_ownership_still_aborts() {
     new_box
-    # chown deploy:deploy fails because their primary group has another name.
-    in_box useradd -m -s /bin/bash -g users deploy
+    # Root owns the keys, so sshd could not read them, and a read-only mount keeps chown from fixing it.
+    in_box useradd -m -s /bin/bash deploy
+    in_box install -d -m 700 /home/deploy/.ssh
+    in_box install -m 600 "$KEY" /home/deploy/.ssh/authorized_keys
+    in_box mount --bind /home/deploy/.ssh /home/deploy/.ssh
+    in_box mount -o remount,ro,bind /home/deploy/.ssh
     harden --username deploy --ssh-key "$KEY" --sudo-access nopasswd
     check "it stopped" stopped
+    check "it says why" said "Could not give deploy ownership"
     check "the user module is reported as failed" said "Critical module 'user' failed"
     check "no SSH hardening was written" no_hardening
     check "root over SSH still works" root_over_ssh
@@ -982,6 +987,43 @@ scenario_wizard_finds_keys_in_home_elsewhere() {
     tty_harden 'Username \[' deploy 'Use this key' y "${WIZARD_TAIL[@]}" 'Start with dry run' y 'Proceed\?' y --
     check "the dry run finishes" exited_ok
     check "it found them" said "Detected key from /srv/deploy/.ssh/authorized_keys"
+}
+
+# ── Scenarios: a primary group not named after the user ──────────────────────
+owned_by() { [[ $(in_box stat -c '%U:%G' "$2") == "$1" ]]; }
+
+scenario_primary_group_with_another_name_works() {
+    new_box
+    in_box useradd -m -s /bin/bash -g users deploy
+    harden --username deploy --ssh-key "$KEY" --sudo-access nopasswd
+    check "the run reports success" exited_ok
+    check "their keys are theirs" owned_by deploy:users /home/deploy/.ssh/authorized_keys
+    check "so is the SOPS config" owned_by deploy:users /home/deploy/.sops.yaml
+    prove_can_get_root_nopasswd deploy
+}
+
+# Every file the script hands over, with the home and the group both looked up.
+scenario_files_handed_over_have_the_right_owner() {
+    new_box
+    in_box useradd -m -d /srv/deploy -s /bin/bash -g users deploy
+    in_box mkdir -p /srv/agent /srv/deploy/.openclaw/workspace
+    in_box sh -c 'echo "{}" > /srv/deploy/.openclaw/openclaw.json'
+    in_box chown -R deploy:users /srv/deploy/.openclaw
+    in_box touch /srv/deploy/.openclaw/workspace/TOOLS.md
+    harden --username deploy --ssh-key "$KEY" --sudo-access nopasswd --agent-dir /srv/agent --openclaw-skill
+    check "the run reports success" exited_ok
+    local file
+    for file in /srv/deploy/.ssh/authorized_keys /srv/deploy/.sops.yaml \
+        /srv/deploy/.openclaw/openclaw.json /srv/deploy/.openclaw/workspace/TOOLS.md \
+        /srv/deploy/.openclaw/workspace/skills/server-report/SKILL.md \
+        /srv/agent/scripts/load-secrets.sh /srv/agent/logs /srv/agent/logging-config.json; do
+        check "$file is theirs" owned_by deploy:users "$file"
+    done
+    # Ubuntu 20.04 has no age package, so no key gets generated there.
+    if in_box sh -c 'command -v age-keygen' >/dev/null; then
+        check "the age key is theirs" owned_by deploy:users /srv/deploy/.config/sops/age/keys.txt
+    fi
+    prove_can_get_root_nopasswd deploy
 }
 
 # ── Runner ───────────────────────────────────────────────────────────────────

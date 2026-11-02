@@ -365,6 +365,13 @@ user_home_dir() {
     echo "$home"
 }
 
+# user:group for chown. A user's primary group does not always carry their name.
+user_owner() {
+    local group
+    group=$(id -gn "$1" 2>/dev/null || true)
+    echo "${1}:${group:-$1}"
+}
+
 # ── SSH lockout protection ──────────────────────────────────────────────────
 verify_ssh_access() {
     local user="$1"
@@ -768,7 +775,7 @@ mod_user() {
 
         chmod 600 "$auth_file"
         # sshd cannot read keys the user does not own
-        chown -R "${USERNAME}:${USERNAME}" "$ssh_dir" || die "Could not give $USERNAME ownership of $ssh_dir"
+        chown -R "$(user_owner "$USERNAME")" "$ssh_dir" || die "Could not give $USERNAME ownership of $ssh_dir"
     fi
 
     # Give the user a working way to sudo
@@ -1138,7 +1145,7 @@ mod_sops() {
             mkdir -p "$age_dir"
             age-keygen -o "$age_key" 2>/dev/null
             chmod 600 "$age_key"
-            chown -R "${USERNAME}:${USERNAME}" "${user_home}/.config"
+            chown -R "$(user_owner "$USERNAME")" "${user_home}/.config"
             log_info "Generated age keypair at $age_key"
             local pub_key
             pub_key=$(grep "^# public key:" "$age_key" | awk '{print $NF}')
@@ -1155,7 +1162,7 @@ mod_sops() {
         if [[ -f "$age_key" ]]; then
             pub_key=$(grep "^# public key:" "$age_key" | awk '{print $NF}')
         fi
-        cat <<SOPSEOF | write_file "$sops_yaml" 644 "${USERNAME}:${USERNAME}"
+        cat <<SOPSEOF | write_file "$sops_yaml" 644 "$(user_owner "$USERNAME")"
 # SOPS config — edit age recipient to match your key
 creation_rules:
   - path_regex: '\.enc\.(env|json|yaml)$'
@@ -1363,7 +1370,7 @@ setup_openclaw_skill() {
             tmp_config=$(mktemp)
             if jq '.tools.exec.safeBins += ["server-report"]' "$oc_config" > "$tmp_config" 2>/dev/null; then
                 mv "$tmp_config" "$oc_config"
-                chown "${USERNAME}:${USERNAME}" "$oc_config"
+                chown "$(user_owner "$USERNAME")" "$oc_config"
                 chmod 600 "$oc_config"
                 log_info "Added server-report to safeBins"
             else
@@ -1431,7 +1438,7 @@ User: "anyone trying to break in?"
 User: "any suspicious changes?"
 -> Run `sudo server-report audit`, summarize by key
 SKILLEOF
-            chown -R "${USERNAME}:${USERNAME}" "$skill_dir"
+            chown -R "$(user_owner "$USERNAME")" "$skill_dir"
             log_info "Created skill at $skill_file"
         fi
     fi
@@ -1453,7 +1460,7 @@ SKILLEOF
 - Runs via sudo NOPASSWD — no password prompt needed
 - See `skills/server-report/SKILL.md` for decision guide on which subcommand to use
 TOOLSEOF
-            chown "${USERNAME}:${USERNAME}" "$tools_md"
+            chown "$(user_owner "$USERNAME")" "$tools_md"
             log_info "Added server-report section to TOOLS.md"
         fi
     else
@@ -1702,7 +1709,7 @@ eval "$(sops -d --output-type dotenv "$SECRETS_FILE" 2>/dev/null)"
 echo "Loaded secrets from $SECRETS_FILE"
 HELPEREOF
             chmod 750 "$helper"
-            chown "${USERNAME}:${USERNAME}" "$helper"
+            chown "$(user_owner "$USERNAME")" "$helper"
             log_info "Deployed load-secrets.sh helper to $helper"
         fi
     else
@@ -1890,7 +1897,7 @@ mod_agent_logging() {
         else
             mkdir -p "$logs_dir"
             chmod 750 "$logs_dir"
-            chown "${USERNAME}:${USERNAME}" "$logs_dir"
+            chown "$(user_owner "$USERNAME")" "$logs_dir"
             logs_ok=true
             log_info "Created logs directory at $logs_dir (750)"
         fi
@@ -1983,7 +1990,7 @@ LJEOF
         else
             echo "$desired_logging" > "$logging_conf"
             chmod 644 "$logging_conf"
-            chown "${USERNAME}:${USERNAME}" "$logging_conf"
+            chown "$(user_owner "$USERNAME")" "$logging_conf"
             log_info "Deployed logging-config.json template"
         fi
     else
