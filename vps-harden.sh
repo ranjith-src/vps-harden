@@ -352,13 +352,27 @@ require_agent_dir() {
     return 0
 }
 
+# ── User lookups ────────────────────────────────────────────────────────────
+# The home in the passwd database, which is where sshd reads keys from. It is not always
+# /home/USER. For a user who does not exist yet, it is the home useradd -m would give them.
+user_home_dir() {
+    local home base
+    home=$(getent passwd "$1" | cut -d: -f6 || true)
+    if [[ -z "$home" ]]; then
+        base=$(useradd -D 2>/dev/null | sed -n 's/^HOME=//p' || true)
+        home="${base:-/home}/$1"
+    fi
+    echo "$home"
+}
+
 # ── SSH lockout protection ──────────────────────────────────────────────────
 verify_ssh_access() {
     local user="$1"
     local errors=0
 
     # Check authorized_keys exist
-    local auth_keys="/home/${user}/.ssh/authorized_keys"
+    local auth_keys
+    auth_keys="$(user_home_dir "$user")/.ssh/authorized_keys"
     if [[ -f "$auth_keys" ]] && [[ -s "$auth_keys" ]]; then
         log_info "SSH keys present in $auth_keys"
     else
@@ -414,7 +428,7 @@ sudo_works_without_password() {
     local user="$1" marker had_marker="false" rc=0
     # Ubuntu's sudo leaves this file in a sudo group member's home the first time it works.
     # Testing sudo is not using it, and a dry run has to leave no trace.
-    marker="$(getent passwd "$user" | cut -d: -f6)/.sudo_as_admin_successful"
+    marker="$(user_home_dir "$user")/.sudo_as_admin_successful"
     [[ ! -e "$marker" ]] || had_marker="true"
     runuser -u "$user" -- sudo -k -n -- /bin/sh -c 'exit 0' &>/dev/null || rc=$?
     [[ "$had_marker" == "true" ]] || rm -f "$marker"
@@ -730,7 +744,8 @@ mod_user() {
     fi
 
     # Deploy SSH keys
-    local ssh_dir="/home/${USERNAME}/.ssh"
+    local ssh_dir
+    ssh_dir="$(user_home_dir "$USERNAME")/.ssh"
     local auth_file="${ssh_dir}/authorized_keys"
 
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -1074,7 +1089,8 @@ mod_firewall_tighten() {
 mod_sops() {
     log_header "Module: sops"
 
-    local user_home="/home/${USERNAME}"
+    local user_home
+    user_home=$(user_home_dir "$USERNAME")
 
     # Install age if missing
     if ! command -v age &>/dev/null; then
@@ -1327,7 +1343,8 @@ LWEOF
 setup_openclaw_skill() {
     log_header "OpenClaw: server-report skill"
 
-    local user_home="/home/${USERNAME}"
+    local user_home
+    user_home=$(user_home_dir "$USERNAME")
     local oc_config="${user_home}/.openclaw/openclaw.json"
 
     if [[ ! -f "$oc_config" ]]; then
@@ -1461,7 +1478,8 @@ TOOLSEOF
 mod_shell() {
     log_header "Module: shell"
 
-    local user_home="/home/${USERNAME}"
+    local user_home
+    user_home=$(user_home_dir "$USERNAME")
     local bashrc="${user_home}/.bashrc"
 
     # umask
@@ -2176,7 +2194,8 @@ mod_verify() {
     fi
 
     # SSH keys
-    local auth_keys="/home/${USERNAME}/.ssh/authorized_keys"
+    local auth_keys
+    auth_keys="$(user_home_dir "$USERNAME")/.ssh/authorized_keys"
     if [[ -f "$auth_keys" ]] && [[ -s "$auth_keys" ]]; then
         local key_count
         key_count=$(grep -c "^ssh-" "$auth_keys" || true)
@@ -2342,7 +2361,8 @@ mod_verify() {
     fi
 
     # Plaintext secrets
-    local user_bashrc="/home/${USERNAME}/.bashrc"
+    local user_bashrc
+    user_bashrc="$(user_home_dir "$USERNAME")/.bashrc"
     if [[ -f "$user_bashrc" ]] && grep -qEi '(api.?key|secret|token|password)\s*=\s*["\x27]?[a-zA-Z0-9_-]{20,}' "$user_bashrc" 2>/dev/null; then
         sc_add "FAIL" "Plaintext secrets in .bashrc" "manual cleanup needed"
     else
@@ -2482,8 +2502,8 @@ mod_verify() {
 
         # Detect key type and comment for SSH config hint
         local key_type_raw key_comment id_file_name
-        key_type_raw=$(head -1 "/home/${USERNAME}/.ssh/authorized_keys" 2>/dev/null | awk '{print $1}')
-        key_comment=$(head -1 "/home/${USERNAME}/.ssh/authorized_keys" 2>/dev/null | awk '{print $3}')
+        key_type_raw=$(head -1 "$auth_keys" 2>/dev/null | awk '{print $1}')
+        key_comment=$(head -1 "$auth_keys" 2>/dev/null | awk '{print $3}')
         case "$key_type_raw" in
             ssh-ed25519)       id_file_name="id_ed25519" ;;
             ssh-rsa)           id_file_name="id_rsa" ;;
@@ -2645,7 +2665,7 @@ interactive_setup() {
         # Try to auto-detect from authorized_keys
         local detected_key=""
         local key_file=""
-        for candidate in "/root/.ssh/authorized_keys" "/home/${USERNAME}/.ssh/authorized_keys"; do
+        for candidate in "/root/.ssh/authorized_keys" "$(user_home_dir "$USERNAME")/.ssh/authorized_keys"; do
             if [[ -f "$candidate" ]]; then
                 detected_key=$(grep -m1 "^ssh-" "$candidate" 2>/dev/null || true)
                 if [[ -n "$detected_key" ]]; then
@@ -2728,7 +2748,7 @@ interactive_setup() {
                     read -r
                     # Re-check for keys
                     local copied_key=""
-                    for candidate in "/root/.ssh/authorized_keys" "/home/${USERNAME}/.ssh/authorized_keys"; do
+                    for candidate in "/root/.ssh/authorized_keys" "$(user_home_dir "$USERNAME")/.ssh/authorized_keys"; do
                         if [[ -f "$candidate" ]]; then
                             copied_key=$(grep -m1 "^ssh-" "$candidate" 2>/dev/null || true)
                             if [[ -n "$copied_key" ]]; then

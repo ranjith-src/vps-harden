@@ -928,6 +928,62 @@ scenario_wizard_command_keeps_pasted_key_together() {
     prove_can_get_root_nopasswd deploy
 }
 
+# ── Scenarios: a home that is not /home/USER ─────────────────────────────────
+# sshd reads keys from the home in the passwd database, so that is where they have to go.
+scenario_home_elsewhere_gets_the_keys() {
+    new_box
+    in_box useradd -m -d /srv/deploy -s /bin/bash deploy
+    harden --username deploy --ssh-key "$KEY" --sudo-access nopasswd
+    check "the run reports success" exited_ok
+    check "the keys are in their home" in_box test -s /srv/deploy/.ssh/authorized_keys
+    check "the scorecard found them" said "[PASS] SSH authorized_keys has 1 key(s)"
+    refute "nothing was put in /home/deploy" in_box test -e /home/deploy
+    check "the shell settings are in their .bashrc" in_box grep -q '^umask 027' /srv/deploy/.bashrc
+    check "the SOPS config is in their home" in_box test -f /srv/deploy/.sops.yaml
+    prove_can_get_root_nopasswd deploy
+
+    in_box sh -c 'echo API_KEY=abcdefghijklmnopqrstuvwxyz123456 >> /srv/deploy/.bashrc'
+    harden --username deploy --ssh-key "$KEY" --only verify
+    check "the scorecard reads their .bashrc" said "[FAIL] Plaintext secrets in .bashrc"
+}
+
+scenario_new_user_home_follows_useradd_defaults() {
+    new_box
+    in_box useradd -D -b /srv
+    snapshot
+    harden --username deploy --ssh-key "$KEY" --sudo-access nopasswd --dry-run
+    check "the dry run names the home useradd will pick" said "Ensure /srv/deploy/.ssh exists"
+    check "nothing on the box changed" unchanged
+    harden --username deploy --ssh-key "$KEY" --sudo-access nopasswd
+    check "the run reports success" exited_ok
+    check "the keys are in their home" in_box test -s /srv/deploy/.ssh/authorized_keys
+    refute "nothing was put in /home/deploy" in_box test -e /home/deploy
+    prove_can_get_root_nopasswd deploy
+}
+
+# sshd will not read this copy, so it cannot be what lets the ssh module go ahead.
+scenario_keys_in_the_wrong_home_stop_the_ssh_module() {
+    new_box
+    in_box sh -c "useradd -m -d /srv/deploy -s /bin/bash deploy; echo 'deploy ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/deploy; chmod 440 /etc/sudoers.d/deploy"
+    in_box install -D -m 600 -o deploy -g deploy "$KEY" /home/deploy/.ssh/authorized_keys
+    harden --username deploy --ssh-key "$KEY" --skip user
+    check "it stopped" stopped
+    check "the rollback ran" said "SSH config rolled back to prevent lockout"
+    check "it names the file it looked for" said "No SSH keys found in /srv/deploy/.ssh/authorized_keys"
+    check "no SSH hardening is left" no_hardening
+    check "root over SSH still works" root_over_ssh
+}
+
+scenario_wizard_finds_keys_in_home_elsewhere() {
+    new_box
+    in_box sh -c "useradd -m -d /srv/deploy -s /bin/bash deploy; echo 'deploy ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/deploy; chmod 440 /etc/sudoers.d/deploy"
+    in_box install -D -m 600 -o deploy -g deploy "$KEY" /srv/deploy/.ssh/authorized_keys
+    in_box rm /root/.ssh/authorized_keys
+    tty_harden 'Username \[' deploy 'Use this key' y "${WIZARD_TAIL[@]}" 'Start with dry run' y 'Proceed\?' y --
+    check "the dry run finishes" exited_ok
+    check "it found them" said "Detected key from /srv/deploy/.ssh/authorized_keys"
+}
+
 # ── Runner ───────────────────────────────────────────────────────────────────
 ALL_SCENARIOS=$(grep -E '^scenario_[a-z_]+\(\)' "${BASH_SOURCE[0]}" | sed 's/^scenario_//; s/().*//')
 
