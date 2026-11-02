@@ -1026,6 +1026,21 @@ scenario_files_handed_over_have_the_right_owner() {
     prove_can_get_root_nopasswd deploy
 }
 
+# ── Scenarios: the wizard's summary ──────────────────────────────────────────
+said_once() { [[ $(grep -cF -- "$1" "$OUT") -eq 1 ]]; }
+
+scenario_wizard_summary_lists_netbird_once() {
+    new_box
+    tty_harden 'Username \[' deploy 'Use this key' y 'Choice \[1\]' 2 "${WIZARD_TAIL[@]}" \
+        'Start with dry run' y 'Proceed\?' y --
+    check "it says Netbird was skipped" said "Netbird:      <skipped>"
+    check "it says so once" said_once "Netbird:"
+    tty_harden 'Username \[' deploy 'Use this key' y 'Choice \[1\]' 2 'Safety IP.*skip' skip 'Timezone \[' skip \
+        'Netbird setup key' nbs-abcdefghij 'Start with dry run' y 'Proceed\?' y --
+    check "it shows the start of a key" said "Netbird:      nbs-abcd..."
+    check "it shows that once too" said_once "Netbird:"
+}
+
 # ── Runner ───────────────────────────────────────────────────────────────────
 ALL_SCENARIOS=$(grep -E '^scenario_[a-z_]+\(\)' "${BASH_SOURCE[0]}" | sed 's/^scenario_//; s/().*//')
 

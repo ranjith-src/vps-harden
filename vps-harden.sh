@@ -2914,8 +2914,9 @@ interactive_setup() {
     printf "   Sudo access:  %s\n" "${SUDO_ACCESS:-already set up}"
     printf "   Safety IP:    %s\n" "${SSH_SAFETY_IP:-<skipped>}"
     printf "   Timezone:     %s\n" "${TIMEZONE:-<skipped>}"
-    printf "   Netbird:      %s\n" "${NETBIRD_KEY:+${NETBIRD_KEY:0:8}...}"
-    [[ -z "$NETBIRD_KEY" ]] && printf "   Netbird:      %s\n" "<skipped>"
+    local netbird_display="<skipped>"
+    [[ -z "$NETBIRD_KEY" ]] || netbird_display="${NETBIRD_KEY:0:8}..."
+    printf "   Netbird:      %s\n" "$netbird_display"
     printf "   Dry run:      %s\n" "$DRY_RUN"
     echo ""
 
