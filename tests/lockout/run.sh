@@ -4,6 +4,8 @@
 # Each scenario boots a new container that behaves like a fresh VPS (real systemd, sshd and
 # sudo), runs vps-harden in it, then tries to get root the way its owner would: over SSH with
 # their key, typing at real sudo and su prompts. Needs Docker and nothing else.
+# The later scenarios hold the script to what it reports and prints: the scorecard's SSH row,
+# homes and groups it has to look up, and commands meant to be pasted.
 #
 # Usage: tests/lockout/run.sh [-l] [SCENARIO ...]     -l lists the scenarios
 #   BASE=debian:12     base image (default ubuntu:24.04)
@@ -789,6 +791,90 @@ scenario_ssh_rollback_still_works() {
     check "the rollback ran" said "SSH config rolled back to prevent lockout"
     check "no SSH hardening is left" no_hardening
     check "root over SSH still works" root_over_ssh
+}
+
+# ── Scenarios: the scorecard tells the truth about SSH ───────────────────────
+SSH_OPEN="[WARN] SSH (22/tcp) open to Anywhere"
+SSH_RESTRICTED="[PASS] SSH restricted (not open to 0.0.0.0)"
+
+# ssh_row open|restricted RULE ...: reads the scorecard with only these rules in an active firewall.
+ssh_row() {
+    local expected="$1" rule
+    shift
+    in_box sh -c 'ufw --force reset; ufw default deny incoming; ufw --force enable' >/dev/null 2>&1
+    for rule in "$@"; do
+        in_box sh -c "ufw $rule" >/dev/null 2>&1 || fail "ufw refused: $rule"
+    done
+    harden --username deploy --ssh-key "$KEY" --only verify
+    if [[ "$expected" == "open" ]]; then
+        check "with [$*]: the scorecard warns" said "$SSH_OPEN"
+    else
+        check "with [$*]: the scorecard passes" said "$SSH_RESTRICTED"
+    fi
+}
+
+scenario_scorecard_warns_when_ssh_is_open() {
+    new_box
+    harden --username deploy --ssh-key "$KEY" --only verify
+    check "with the firewall off, it warns" said "$SSH_OPEN"
+    refute "with the firewall off, it does not pass" said "$SSH_RESTRICTED"
+
+    harden --username deploy --ssh-key "$KEY" --only firewall,verify
+    check "the firewall module leaves 22/tcp open" in_box sh -c 'ufw status | grep -E "^22/tcp +ALLOW +Anywhere"'
+    check "that is what it warns about" said "$SSH_OPEN"
+    refute "it does not also pass" said "$SSH_RESTRICTED"
+    harden --username deploy --ssh-key "$KEY" --dry-run
+    check "a dry run says what closes it" said "needs --netbird-key and --ssh-safety-ip"
+
+    ssh_row open 'allow 22/tcp'
+    ssh_row open 'allow ssh'
+    ssh_row open 'allow 22'
+    ssh_row open 'allow OpenSSH'
+    ssh_row open 'limit 22/tcp'
+    ssh_row open 'allow 22,80,443/tcp'
+    ssh_row open 'allow 20:30/tcp'
+    ssh_row open 'allow in on eth0 to any port 22 proto tcp'
+    ssh_row open 'allow to 203.0.113.5 port 22 proto tcp'
+    ssh_row open 'allow to 203.0.113.5'
+    ssh_row open 'allow from any'
+    ssh_row open 'allow from ::/0 to any port 22 proto tcp'
+    ssh_row open "allow 22/tcp comment 'public'"
+    ssh_row open 'default allow incoming'
+}
+
+# None of these lets a stranger reach SSH, though several say 22/tcp and Anywhere in one row.
+scenario_scorecard_passes_when_ssh_is_restricted() {
+    new_box
+    ssh_row restricted
+    ssh_row restricted 'allow in on wt0'
+    ssh_row restricted 'allow in on wt0 to any port 22 proto tcp'
+    ssh_row restricted 'allow from 203.0.113.10 to any port 22 proto tcp'
+    ssh_row restricted 'allow from 2001:db8::1 to any port 22 proto tcp'
+    ssh_row restricted 'allow from 203.0.113.10'
+    ssh_row restricted 'deny 22/tcp'
+    ssh_row restricted 'reject 22/tcp'
+    ssh_row restricted 'allow out 22/tcp'
+    ssh_row restricted 'route allow 22/tcp'
+    ssh_row restricted 'allow out on wt0'
+    ssh_row restricted 'allow 22/udp'
+    ssh_row restricted 'allow 222/tcp' 'allow 2222/tcp' 'allow 80,443/tcp' 'allow 2200:2300/tcp'
+    ssh_row restricted "allow 80/tcp comment '22/tcp ALLOW IN Anywhere'"
+    ssh_row restricted "allow from 203.0.113.10 to any port 22 proto tcp comment 'ALLOW IN Anywhere'"
+}
+
+# A veth link stands in for Netbird's wt0, so the script's own modules do the tightening.
+scenario_scorecard_follows_firewall_tighten() {
+    new_box
+    in_box ip link add wt0 type veth peer name wt0-peer
+    harden --username deploy --ssh-key "$KEY" --only firewall,firewall_tighten,verify
+    check "the tunnel rule is in" in_box sh -c 'ufw status | grep "Anywhere on wt0"'
+    # firewall_tighten only removes the broad rule when it is given a safety IP.
+    check "the broad rule is still there" in_box sh -c 'ufw status | grep -E "^22/tcp +ALLOW +Anywhere"'
+    check "so it warns" said "$SSH_OPEN"
+    harden --username deploy --ssh-key "$KEY" --ssh-safety-ip 203.0.113.10 --only firewall,firewall_tighten,verify
+    refute "the broad rule is gone" in_box sh -c 'ufw status | grep -E "^22/tcp.*ALLOW +Anywhere"'
+    check "the safety IP is in" in_box sh -c 'ufw status | grep -E "^22/tcp +ALLOW +203.0.113.10"'
+    check "so it passes" said "$SSH_RESTRICTED"
 }
 
 # ── Runner ───────────────────────────────────────────────────────────────────

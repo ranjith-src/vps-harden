@@ -172,7 +172,7 @@ At the end of the run, you'll see a grouped scorecard with section headers:
 
   ── Firewall — Controls network traffic ──
   [PASS] UFW active, default deny
-  [PASS] SSH restricted (not open to 0.0.0.0)
+  [WARN] SSH (22/tcp) open to Anywhere
 
   ── Intrusion Prevention — Blocks brute-force attacks ──
   [PASS] fail2ban sshd jail active
@@ -200,7 +200,7 @@ At the end of the run, you'll see a grouped scorecard with section headers:
   [PASS] No plaintext secrets in .bashrc
   [PASS] authorized_keys permissions 600
 --------------------------------------------------------------------
-  SCORE: 25 PASSED | 1 WARNING | 0 FAILED
+  SCORE: 24 PASSED | 2 WARNING | 0 FAILED
 --------------------------------------------------------------------
 
   NEXT STEPS:
@@ -213,7 +213,7 @@ At the end of the run, you'll see a grouped scorecard with section headers:
 ```
 
 - **PASS** — correctly configured, no action needed
-- **WARN** — not critical, but review (e.g. Netbird not set up is fine if you don't need VPN)
+- **WARN** — not critical, but review (e.g. without Netbird, SSH stays open to Anywhere, which is fine if you don't need VPN)
 - **FAIL** — something needs fixing. The label explains what's wrong
 
 In **dry-run mode**, items that would be fixed on a real run are annotated with `← will fix`.

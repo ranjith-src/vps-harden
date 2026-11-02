@@ -2201,8 +2201,8 @@ mod_verify() {
     fi
 
     # Check SSH not open to Anywhere (0.0.0.0/0)
-    if ufw status 2>/dev/null | grep "22/tcp" | grep -q "Anywhere" | grep -v "on wt0"; then
-        sc_add "WARN" "SSH (22/tcp) open to Anywhere" "needs --netbird-key"
+    if ssh_open_to_anyone; then
+        sc_add "WARN" "SSH (22/tcp) open to Anywhere" "needs --netbird-key and --ssh-safety-ip"
     else
         sc_add "PASS" "SSH restricted (not open to 0.0.0.0)"
     fi
@@ -2527,6 +2527,33 @@ mod_verify() {
         fi
         echo ""
     fi
+}
+
+# True if anyone can reach SSH through the firewall: it is off, it lets everything in by default,
+# or a rule lets in traffic from Anywhere to port 22. A rule "on wt0" does not count, because
+# only Netbird peers get there. A destination that names no ports means all of them.
+ssh_open_to_anyone() {
+    local status open_rows
+    status=$(LANGUAGE=C LC_ALL=C ufw status verbose 2>/dev/null || true)
+    grep -q '^Status: active' <<< "$status" || return 0
+    if grep -q '^Default: allow (incoming)' <<< "$status"; then
+        return 0
+    fi
+    open_rows=$(awk '
+        { sub(/ *#.*/, "") }
+        / on wt0 / || !/ (ALLOW|LIMIT) IN +Anywhere/ { next }
+        {
+            dest = ($2 ~ /^[0-9]/) ? $2 : $1   # an address can come before the ports
+            if (dest ~ /\/udp$/) next
+            if (dest !~ /^[0-9,:]+(\/tcp)?$/) { print; next }
+            sub(/\/tcp$/, "", dest)
+            n = split(dest, ports, ",")
+            for (i = 1; i <= n; i++) {
+                m = split(ports[i], range, ":")
+                if (range[1] + 0 <= 22 && 22 <= range[m] + 0) { print; next }
+            }
+        }' <<< "$status")
+    [[ -n "$open_rows" ]]
 }
 
 check_ssh_setting() {

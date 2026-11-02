@@ -120,7 +120,7 @@ The `verify` module prints a grouped scorecard at the end of every run. Section 
 
   ── Firewall — Controls network traffic ──
   [PASS] UFW active, default deny
-  [PASS] SSH restricted (not open to 0.0.0.0)
+  [WARN] SSH (22/tcp) open to Anywhere
 
   ── Intrusion Prevention — Blocks brute-force attacks ──
   [PASS] fail2ban sshd jail active
@@ -156,7 +156,7 @@ The `verify` module prints a grouped scorecard at the end of every run. Section 
   [PASS] Agent logs directory exists (750)
   [PASS] Data directory permissions 700 (owner-only)
 --------------------------------------------------------------------
-  SCORE: 30 PASSED | 1 WARNING | 0 FAILED
+  SCORE: 29 PASSED | 2 WARNING | 0 FAILED
 --------------------------------------------------------------------
 ```
 
