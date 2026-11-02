@@ -22,3 +22,19 @@ jobs:
         with:
           scandir: .
           additional_files: vps-harden.sh install.sh
+
+  lockout:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        base: ["ubuntu:24.04", "ubuntu:26.04"]  # classic sudo, sudo-rs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the test compares against the last release's script
+
+      - name: Lockout test
+        env:
+          BASE: ${{ matrix.base }}
+        run: tests/lockout/run.sh
