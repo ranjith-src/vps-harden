@@ -2518,7 +2518,7 @@ mod_verify() {
             echo "    Get a setup key from https://app.netbird.io → Setup Keys, then re-run:"
             local rerun_cmd
             rerun_cmd=$(build_rerun_cmd "false")
-            echo -e "      ${CYAN}${rerun_cmd} --netbird-key YOUR_KEY${NC}"
+            printf '      %b%s --netbird-key YOUR_KEY%b\n' "$CYAN" "$rerun_cmd" "$NC"
         fi
 
         if [[ $SC_WARN -eq 0 && $SC_FAIL -eq 0 ]]; then
@@ -2572,23 +2572,33 @@ check_ssh_setting() {
 }
 
 # ── Build re-run command ──────────────────────────────────────────────────────
+# Quotes a value for a command someone will paste. Ordinary values stay as they are.
+shell_quote() {
+    if [[ "$1" =~ ^[A-Za-z0-9_./:=@%+,-]+$ ]]; then
+        printf '%s\n' "$1"
+    else
+        printf '%s\n' "${1@Q}"
+    fi
+}
+
 # Builds the equivalent CLI command from current variable state.
 # Pass "true" as $1 to include --dry-run, omit or "false" to exclude it.
 build_rerun_cmd() {
     local include_dry_run="${1:-false}"
-    local cmd="sudo vps-harden --username ${USERNAME}"
+    local cmd
+    cmd="sudo vps-harden --username $(shell_quote "$USERNAME")"
     if [[ -n "$SSH_KEY" && "$SSH_KEY" != "<wizard>" ]]; then
-        cmd+=" --ssh-key ${SSH_KEY}"
+        cmd+=" --ssh-key $(shell_quote "$SSH_KEY")"
     elif [[ -n "$SSH_KEY_CONTENT" ]]; then
-        cmd+=" --ssh-key \"$(echo "$SSH_KEY_CONTENT" | head -1)\""
+        cmd+=" --ssh-key $(shell_quote "$(echo "$SSH_KEY_CONTENT" | head -1)")"
     fi
-    [[ -n "$SUDO_ACCESS" ]] && cmd+=" --sudo-access ${SUDO_ACCESS}"
-    [[ -n "$SSH_SAFETY_IP" ]] && cmd+=" --ssh-safety-ip ${SSH_SAFETY_IP}"
-    [[ -n "$TIMEZONE" ]] && cmd+=" --timezone ${TIMEZONE}"
-    [[ -n "$NETBIRD_KEY" ]] && cmd+=" --netbird-key ${NETBIRD_KEY}"
-    [[ -n "$AGENT_DIR" ]] && cmd+=" --agent-dir ${AGENT_DIR}"
-    [[ "$WEBHOOK_PORT" != "5000" ]] && cmd+=" --webhook-port ${WEBHOOK_PORT}"
-    [[ -n "$AGENT_DATA_DIR" ]] && cmd+=" --agent-data-dir ${AGENT_DATA_DIR}"
+    [[ -n "$SUDO_ACCESS" ]] && cmd+=" --sudo-access $(shell_quote "$SUDO_ACCESS")"
+    [[ -n "$SSH_SAFETY_IP" ]] && cmd+=" --ssh-safety-ip $(shell_quote "$SSH_SAFETY_IP")"
+    [[ -n "$TIMEZONE" ]] && cmd+=" --timezone $(shell_quote "$TIMEZONE")"
+    [[ -n "$NETBIRD_KEY" ]] && cmd+=" --netbird-key $(shell_quote "$NETBIRD_KEY")"
+    [[ -n "$AGENT_DIR" ]] && cmd+=" --agent-dir $(shell_quote "$AGENT_DIR")"
+    [[ "$WEBHOOK_PORT" != "5000" ]] && cmd+=" --webhook-port $(shell_quote "$WEBHOOK_PORT")"
+    [[ -n "$AGENT_DATA_DIR" ]] && cmd+=" --agent-data-dir $(shell_quote "$AGENT_DATA_DIR")"
     [[ "$include_dry_run" == "true" ]] && cmd+=" --dry-run"
     echo "$cmd"
 }
@@ -2891,7 +2901,7 @@ interactive_setup() {
     fi
 
     echo "   For future runs:"
-    echo -e "   ${CYAN}${cli_cmd}${NC}"
+    printf '   %b%s%b\n' "$CYAN" "$cli_cmd" "$NC"
     echo ""
 
     printf "   Proceed? [Y/n]: "
@@ -2972,7 +2982,7 @@ main() {
         local rerun_cmd
         rerun_cmd=$(build_rerun_cmd "false")
         echo -e "${YELLOW}This was a dry run. To apply changes, run:${NC}"
-        echo -e "  ${CYAN}${rerun_cmd}${NC}"
+        printf '  %b%s%b\n' "$CYAN" "$rerun_cmd" "$NC"
         if [[ "$SUDO_CHOICE_NEEDED" == "true" ]]; then
             echo -e "${YELLOW}Add --sudo-access password or --sudo-access nopasswd, or that command will stop.${NC}"
         fi

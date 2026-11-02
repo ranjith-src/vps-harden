@@ -877,6 +877,57 @@ scenario_scorecard_follows_firewall_tighten() {
     check "so it passes" said "$SSH_RESTRICTED"
 }
 
+# ── Scenarios: the commands it prints can be pasted ──────────────────────────
+# A key with a comment a shell would trip over. sshd does not read comments, so it still logs in.
+awkward_key() {
+    printf '%s %s\n' "$(in_box cut -d' ' -f1,2 "$KEY")" "it's \$HOME \"my\" \`laptop\` a\\tb"
+}
+
+# Prints the command on the line after the one that matches.
+printed_after() { sed -n "/$1/{n;s/\r//;s/^ *//;p;q;}" "$OUT"; }
+
+# Runs a printed command as pasting it into a shell on the box would.
+paste_command() {
+    local command="$1"
+    OUT="$WORK/${SCENARIO}.$BOX_COUNT.pasted.out"
+    in_box bash -c "$command" > "$OUT" 2>&1 < /dev/null
+    RC=$?
+}
+
+scenario_printed_command_keeps_inline_key_together() {
+    new_box
+    local plain key
+    plain=$(in_box cat "$KEY")
+    harden --username deploy --ssh-key "$plain" --sudo-access nopasswd --dry-run
+    check "the dry run finishes" exited_ok
+    paste_command "$(printed_after 'To apply changes, run') --dry-run"
+    check "the printed command runs" exited_ok
+
+    harden --username deploy --ssh-key "$KEY" --sudo-access nopasswd --dry-run
+    check "a path stays as it is" said "--ssh-key $KEY --sudo-access"
+
+    key=$(awkward_key)
+    harden --username deploy --ssh-key "$key" --sudo-access nopasswd --dry-run
+    check "the dry run finishes with an awkward comment" exited_ok
+    paste_command "$(printed_after 'To apply changes, run')"
+    check "the printed command runs for real" exited_ok
+    check "the key arrives whole" in_box grep -qxF "$key" /home/deploy/.ssh/authorized_keys
+    prove_can_get_root_nopasswd deploy
+}
+
+scenario_wizard_command_keeps_pasted_key_together() {
+    new_box
+    local key
+    key=$(awkward_key)
+    tty_harden 'Username \[' deploy 'Use this key' n 'Choice \[1\]' 3 'SSH public key:' "$key" 'Choice \[1\]' 2 \
+        "${WIZARD_TAIL[@]}" 'Start with dry run' y 'Proceed\?' y --
+    check "the dry run finishes" exited_ok
+    paste_command "$(printed_after 'To apply changes, run')"
+    check "the printed command runs for real" exited_ok
+    check "the key arrives whole" in_box grep -qxF "$key" /home/deploy/.ssh/authorized_keys
+    prove_can_get_root_nopasswd deploy
+}
+
 # ── Runner ───────────────────────────────────────────────────────────────────
 ALL_SCENARIOS=$(grep -E '^scenario_[a-z_]+\(\)' "${BASH_SOURCE[0]}" | sed 's/^scenario_//; s/().*//')
 
