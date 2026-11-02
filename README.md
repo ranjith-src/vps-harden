@@ -270,11 +270,14 @@ Dry runs never stop: they warn, and the scorecard shows `[FAIL] deploy cannot su
 
 | OS | Version | Status |
 |----|---------|--------|
+| Ubuntu | 26.04 LTS | Tested in containers |
 | Ubuntu | 24.04 LTS | Tested |
 | Ubuntu | 22.04 LTS | Tested |
 | Ubuntu | 20.04 LTS | Tested |
-| Debian | 12 (Bookworm) | Untested (should work) |
+| Debian | 12 (Bookworm) | Tested in containers |
 | Debian | 11 (Bullseye) | Untested (should work) |
+
+**Tested in containers** means `tests/lockout/run.sh` passes there: real systemd, sshd and sudo in a container, not a real VPS. On Ubuntu 26.04 that is `sudo-rs`.
 
 **Architecture:** amd64, arm64
 
