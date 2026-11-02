@@ -120,7 +120,7 @@ The `verify` module prints a grouped scorecard at the end of every run. Section 
 
   ── Firewall — Controls network traffic ──
   [PASS] UFW active, default deny
-  [PASS] SSH restricted (not open to 0.0.0.0)
+  [WARN] SSH (22/tcp) open to Anywhere
 
   ── Intrusion Prevention — Blocks brute-force attacks ──
   [PASS] fail2ban sshd jail active
@@ -156,7 +156,7 @@ The `verify` module prints a grouped scorecard at the end of every run. Section 
   [PASS] Agent logs directory exists (750)
   [PASS] Data directory permissions 700 (owner-only)
 --------------------------------------------------------------------
-  SCORE: 30 PASSED | 1 WARNING | 0 FAILED
+  SCORE: 29 PASSED | 2 WARNING | 0 FAILED
 --------------------------------------------------------------------
 ```
 
@@ -197,9 +197,6 @@ All output is plain text — no colors, no control codes. Safe for piping, loggi
 | `--ssh-key KEY` | Yes* | SSH public key (file path or inline `ssh-*` string) |
 | `--sudo-access MODE` | Yes*† | How the user gets root: `password` or `nopasswd` ([details](#lockout-protection)) |
 | `--interactive` | No | Force interactive setup wizard |
-
-\* Not required when using the interactive wizard (`sudo vps-harden` with no args).
-† Only if the user cannot sudo already.
 | `--ssh-safety-ip IP` | No | IP to always allow SSH from (safety net before tightening) |
 | `--netbird-key KEY` | No | Netbird setup key for mesh VPN (skips VPN module if omitted) |
 | `--timezone TZ` | No | System timezone (e.g. `Europe/Amsterdam`, `UTC`) |
@@ -217,6 +214,10 @@ All output is plain text — no colors, no control codes. Safe for piping, loggi
 | `--verbose` | No | Show command output instead of redirecting to log |
 | `--version` | No | Print version and exit |
 | `-h`, `--help` | No | Show usage help |
+
+\* Not required when using the interactive wizard (`sudo vps-harden` with no args).
+
+† Only if the user cannot sudo already.
 
 ---
 
@@ -269,11 +270,14 @@ Dry runs never stop: they warn, and the scorecard shows `[FAIL] deploy cannot su
 
 | OS | Version | Status |
 |----|---------|--------|
+| Ubuntu | 26.04 LTS | Tested in containers |
 | Ubuntu | 24.04 LTS | Tested |
 | Ubuntu | 22.04 LTS | Tested |
 | Ubuntu | 20.04 LTS | Tested |
-| Debian | 12 (Bookworm) | Untested (should work) |
+| Debian | 12 (Bookworm) | Tested in containers |
 | Debian | 11 (Bullseye) | Untested (should work) |
+
+**Tested in containers** means `tests/lockout/run.sh` passes there: real systemd, sshd and sudo in a container, not a real VPS. On Ubuntu 26.04 that is `sudo-rs`.
 
 **Architecture:** amd64, arm64
 

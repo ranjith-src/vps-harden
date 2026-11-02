@@ -352,13 +352,34 @@ require_agent_dir() {
     return 0
 }
 
+# ── User lookups ────────────────────────────────────────────────────────────
+# The home in the passwd database, which is where sshd reads keys from. It is not always
+# /home/USER. For a user who does not exist yet, it is the home useradd -m would give them.
+user_home_dir() {
+    local home base
+    home=$(getent passwd "$1" | cut -d: -f6 || true)
+    if [[ -z "$home" ]]; then
+        base=$(useradd -D 2>/dev/null | sed -n 's/^HOME=//p' || true)
+        home="${base:-/home}/$1"
+    fi
+    echo "$home"
+}
+
+# user:group for chown. A user's primary group does not always carry their name.
+user_owner() {
+    local group
+    group=$(id -gn "$1" 2>/dev/null || true)
+    echo "${1}:${group:-$1}"
+}
+
 # ── SSH lockout protection ──────────────────────────────────────────────────
 verify_ssh_access() {
     local user="$1"
     local errors=0
 
     # Check authorized_keys exist
-    local auth_keys="/home/${user}/.ssh/authorized_keys"
+    local auth_keys
+    auth_keys="$(user_home_dir "$user")/.ssh/authorized_keys"
     if [[ -f "$auth_keys" ]] && [[ -s "$auth_keys" ]]; then
         log_info "SSH keys present in $auth_keys"
     else
@@ -414,7 +435,7 @@ sudo_works_without_password() {
     local user="$1" marker had_marker="false" rc=0
     # Ubuntu's sudo leaves this file in a sudo group member's home the first time it works.
     # Testing sudo is not using it, and a dry run has to leave no trace.
-    marker="$(getent passwd "$user" | cut -d: -f6)/.sudo_as_admin_successful"
+    marker="$(user_home_dir "$user")/.sudo_as_admin_successful"
     [[ ! -e "$marker" ]] || had_marker="true"
     runuser -u "$user" -- sudo -k -n -- /bin/sh -c 'exit 0' &>/dev/null || rc=$?
     [[ "$had_marker" == "true" ]] || rm -f "$marker"
@@ -730,7 +751,8 @@ mod_user() {
     fi
 
     # Deploy SSH keys
-    local ssh_dir="/home/${USERNAME}/.ssh"
+    local ssh_dir
+    ssh_dir="$(user_home_dir "$USERNAME")/.ssh"
     local auth_file="${ssh_dir}/authorized_keys"
 
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -753,7 +775,7 @@ mod_user() {
 
         chmod 600 "$auth_file"
         # sshd cannot read keys the user does not own
-        chown -R "${USERNAME}:${USERNAME}" "$ssh_dir" || die "Could not give $USERNAME ownership of $ssh_dir"
+        chown -R "$(user_owner "$USERNAME")" "$ssh_dir" || die "Could not give $USERNAME ownership of $ssh_dir"
     fi
 
     # Give the user a working way to sudo
@@ -1074,7 +1096,8 @@ mod_firewall_tighten() {
 mod_sops() {
     log_header "Module: sops"
 
-    local user_home="/home/${USERNAME}"
+    local user_home
+    user_home=$(user_home_dir "$USERNAME")
 
     # Install age if missing
     if ! command -v age &>/dev/null; then
@@ -1122,7 +1145,7 @@ mod_sops() {
             mkdir -p "$age_dir"
             age-keygen -o "$age_key" 2>/dev/null
             chmod 600 "$age_key"
-            chown -R "${USERNAME}:${USERNAME}" "${user_home}/.config"
+            chown -R "$(user_owner "$USERNAME")" "${user_home}/.config"
             log_info "Generated age keypair at $age_key"
             local pub_key
             pub_key=$(grep "^# public key:" "$age_key" | awk '{print $NF}')
@@ -1139,7 +1162,7 @@ mod_sops() {
         if [[ -f "$age_key" ]]; then
             pub_key=$(grep "^# public key:" "$age_key" | awk '{print $NF}')
         fi
-        cat <<SOPSEOF | write_file "$sops_yaml" 644 "${USERNAME}:${USERNAME}"
+        cat <<SOPSEOF | write_file "$sops_yaml" 644 "$(user_owner "$USERNAME")"
 # SOPS config — edit age recipient to match your key
 creation_rules:
   - path_regex: '\.enc\.(env|json|yaml)$'
@@ -1327,7 +1350,8 @@ LWEOF
 setup_openclaw_skill() {
     log_header "OpenClaw: server-report skill"
 
-    local user_home="/home/${USERNAME}"
+    local user_home
+    user_home=$(user_home_dir "$USERNAME")
     local oc_config="${user_home}/.openclaw/openclaw.json"
 
     if [[ ! -f "$oc_config" ]]; then
@@ -1346,7 +1370,7 @@ setup_openclaw_skill() {
             tmp_config=$(mktemp)
             if jq '.tools.exec.safeBins += ["server-report"]' "$oc_config" > "$tmp_config" 2>/dev/null; then
                 mv "$tmp_config" "$oc_config"
-                chown "${USERNAME}:${USERNAME}" "$oc_config"
+                chown "$(user_owner "$USERNAME")" "$oc_config"
                 chmod 600 "$oc_config"
                 log_info "Added server-report to safeBins"
             else
@@ -1414,7 +1438,7 @@ User: "anyone trying to break in?"
 User: "any suspicious changes?"
 -> Run `sudo server-report audit`, summarize by key
 SKILLEOF
-            chown -R "${USERNAME}:${USERNAME}" "$skill_dir"
+            chown -R "$(user_owner "$USERNAME")" "$skill_dir"
             log_info "Created skill at $skill_file"
         fi
     fi
@@ -1436,7 +1460,7 @@ SKILLEOF
 - Runs via sudo NOPASSWD — no password prompt needed
 - See `skills/server-report/SKILL.md` for decision guide on which subcommand to use
 TOOLSEOF
-            chown "${USERNAME}:${USERNAME}" "$tools_md"
+            chown "$(user_owner "$USERNAME")" "$tools_md"
             log_info "Added server-report section to TOOLS.md"
         fi
     else
@@ -1461,7 +1485,8 @@ TOOLSEOF
 mod_shell() {
     log_header "Module: shell"
 
-    local user_home="/home/${USERNAME}"
+    local user_home
+    user_home=$(user_home_dir "$USERNAME")
     local bashrc="${user_home}/.bashrc"
 
     # umask
@@ -1684,7 +1709,7 @@ eval "$(sops -d --output-type dotenv "$SECRETS_FILE" 2>/dev/null)"
 echo "Loaded secrets from $SECRETS_FILE"
 HELPEREOF
             chmod 750 "$helper"
-            chown "${USERNAME}:${USERNAME}" "$helper"
+            chown "$(user_owner "$USERNAME")" "$helper"
             log_info "Deployed load-secrets.sh helper to $helper"
         fi
     else
@@ -1872,7 +1897,7 @@ mod_agent_logging() {
         else
             mkdir -p "$logs_dir"
             chmod 750 "$logs_dir"
-            chown "${USERNAME}:${USERNAME}" "$logs_dir"
+            chown "$(user_owner "$USERNAME")" "$logs_dir"
             logs_ok=true
             log_info "Created logs directory at $logs_dir (750)"
         fi
@@ -1965,7 +1990,7 @@ LJEOF
         else
             echo "$desired_logging" > "$logging_conf"
             chmod 644 "$logging_conf"
-            chown "${USERNAME}:${USERNAME}" "$logging_conf"
+            chown "$(user_owner "$USERNAME")" "$logging_conf"
             log_info "Deployed logging-config.json template"
         fi
     else
@@ -2176,7 +2201,8 @@ mod_verify() {
     fi
 
     # SSH keys
-    local auth_keys="/home/${USERNAME}/.ssh/authorized_keys"
+    local auth_keys
+    auth_keys="$(user_home_dir "$USERNAME")/.ssh/authorized_keys"
     if [[ -f "$auth_keys" ]] && [[ -s "$auth_keys" ]]; then
         local key_count
         key_count=$(grep -c "^ssh-" "$auth_keys" || true)
@@ -2201,8 +2227,8 @@ mod_verify() {
     fi
 
     # Check SSH not open to Anywhere (0.0.0.0/0)
-    if ufw status 2>/dev/null | grep "22/tcp" | grep -q "Anywhere" | grep -v "on wt0"; then
-        sc_add "WARN" "SSH (22/tcp) open to Anywhere" "needs --netbird-key"
+    if ssh_open_to_anyone; then
+        sc_add "WARN" "SSH (22/tcp) open to Anywhere" "needs --netbird-key and --ssh-safety-ip"
     else
         sc_add "PASS" "SSH restricted (not open to 0.0.0.0)"
     fi
@@ -2342,7 +2368,8 @@ mod_verify() {
     fi
 
     # Plaintext secrets
-    local user_bashrc="/home/${USERNAME}/.bashrc"
+    local user_bashrc
+    user_bashrc="$(user_home_dir "$USERNAME")/.bashrc"
     if [[ -f "$user_bashrc" ]] && grep -qEi '(api.?key|secret|token|password)\s*=\s*["\x27]?[a-zA-Z0-9_-]{20,}' "$user_bashrc" 2>/dev/null; then
         sc_add "FAIL" "Plaintext secrets in .bashrc" "manual cleanup needed"
     else
@@ -2482,8 +2509,8 @@ mod_verify() {
 
         # Detect key type and comment for SSH config hint
         local key_type_raw key_comment id_file_name
-        key_type_raw=$(head -1 "/home/${USERNAME}/.ssh/authorized_keys" 2>/dev/null | awk '{print $1}')
-        key_comment=$(head -1 "/home/${USERNAME}/.ssh/authorized_keys" 2>/dev/null | awk '{print $3}')
+        key_type_raw=$(head -1 "$auth_keys" 2>/dev/null | awk '{print $1}')
+        key_comment=$(head -1 "$auth_keys" 2>/dev/null | awk '{print $3}')
         case "$key_type_raw" in
             ssh-ed25519)       id_file_name="id_ed25519" ;;
             ssh-rsa)           id_file_name="id_rsa" ;;
@@ -2518,7 +2545,7 @@ mod_verify() {
             echo "    Get a setup key from https://app.netbird.io → Setup Keys, then re-run:"
             local rerun_cmd
             rerun_cmd=$(build_rerun_cmd "false")
-            echo -e "      ${CYAN}${rerun_cmd} --netbird-key YOUR_KEY${NC}"
+            printf '      %b%s --netbird-key YOUR_KEY%b\n' "$CYAN" "$rerun_cmd" "$NC"
         fi
 
         if [[ $SC_WARN -eq 0 && $SC_FAIL -eq 0 ]]; then
@@ -2527,6 +2554,33 @@ mod_verify() {
         fi
         echo ""
     fi
+}
+
+# True if anyone can reach SSH through the firewall: it is off, it lets everything in by default,
+# or a rule lets in traffic from Anywhere to port 22. A rule "on wt0" does not count, because
+# only Netbird peers get there. A destination that names no ports means all of them.
+ssh_open_to_anyone() {
+    local status open_rows
+    status=$(LANGUAGE=C LC_ALL=C ufw status verbose 2>/dev/null || true)
+    grep -q '^Status: active' <<< "$status" || return 0
+    if grep -q '^Default: allow (incoming)' <<< "$status"; then
+        return 0
+    fi
+    open_rows=$(awk '
+        { sub(/ *#.*/, "") }
+        / on wt0 / || !/ (ALLOW|LIMIT) IN +Anywhere/ { next }
+        {
+            dest = ($2 ~ /^[0-9]/) ? $2 : $1   # an address can come before the ports
+            if (dest ~ /\/udp$/) next
+            if (dest !~ /^[0-9,:]+(\/tcp)?$/) { print; next }
+            sub(/\/tcp$/, "", dest)
+            n = split(dest, ports, ",")
+            for (i = 1; i <= n; i++) {
+                m = split(ports[i], range, ":")
+                if (range[1] + 0 <= 22 && 22 <= range[m] + 0) { print; next }
+            }
+        }' <<< "$status")
+    [[ -n "$open_rows" ]]
 }
 
 check_ssh_setting() {
@@ -2545,23 +2599,33 @@ check_ssh_setting() {
 }
 
 # ── Build re-run command ──────────────────────────────────────────────────────
+# Quotes a value for a command someone will paste. Ordinary values stay as they are.
+shell_quote() {
+    if [[ "$1" =~ ^[A-Za-z0-9_./:=@%+,-]+$ ]]; then
+        printf '%s\n' "$1"
+    else
+        printf '%s\n' "${1@Q}"
+    fi
+}
+
 # Builds the equivalent CLI command from current variable state.
 # Pass "true" as $1 to include --dry-run, omit or "false" to exclude it.
 build_rerun_cmd() {
     local include_dry_run="${1:-false}"
-    local cmd="sudo vps-harden --username ${USERNAME}"
+    local cmd
+    cmd="sudo vps-harden --username $(shell_quote "$USERNAME")"
     if [[ -n "$SSH_KEY" && "$SSH_KEY" != "<wizard>" ]]; then
-        cmd+=" --ssh-key ${SSH_KEY}"
+        cmd+=" --ssh-key $(shell_quote "$SSH_KEY")"
     elif [[ -n "$SSH_KEY_CONTENT" ]]; then
-        cmd+=" --ssh-key \"$(echo "$SSH_KEY_CONTENT" | head -1)\""
+        cmd+=" --ssh-key $(shell_quote "$(echo "$SSH_KEY_CONTENT" | head -1)")"
     fi
-    [[ -n "$SUDO_ACCESS" ]] && cmd+=" --sudo-access ${SUDO_ACCESS}"
-    [[ -n "$SSH_SAFETY_IP" ]] && cmd+=" --ssh-safety-ip ${SSH_SAFETY_IP}"
-    [[ -n "$TIMEZONE" ]] && cmd+=" --timezone ${TIMEZONE}"
-    [[ -n "$NETBIRD_KEY" ]] && cmd+=" --netbird-key ${NETBIRD_KEY}"
-    [[ -n "$AGENT_DIR" ]] && cmd+=" --agent-dir ${AGENT_DIR}"
-    [[ "$WEBHOOK_PORT" != "5000" ]] && cmd+=" --webhook-port ${WEBHOOK_PORT}"
-    [[ -n "$AGENT_DATA_DIR" ]] && cmd+=" --agent-data-dir ${AGENT_DATA_DIR}"
+    [[ -n "$SUDO_ACCESS" ]] && cmd+=" --sudo-access $(shell_quote "$SUDO_ACCESS")"
+    [[ -n "$SSH_SAFETY_IP" ]] && cmd+=" --ssh-safety-ip $(shell_quote "$SSH_SAFETY_IP")"
+    [[ -n "$TIMEZONE" ]] && cmd+=" --timezone $(shell_quote "$TIMEZONE")"
+    [[ -n "$NETBIRD_KEY" ]] && cmd+=" --netbird-key $(shell_quote "$NETBIRD_KEY")"
+    [[ -n "$AGENT_DIR" ]] && cmd+=" --agent-dir $(shell_quote "$AGENT_DIR")"
+    [[ "$WEBHOOK_PORT" != "5000" ]] && cmd+=" --webhook-port $(shell_quote "$WEBHOOK_PORT")"
+    [[ -n "$AGENT_DATA_DIR" ]] && cmd+=" --agent-data-dir $(shell_quote "$AGENT_DATA_DIR")"
     [[ "$include_dry_run" == "true" ]] && cmd+=" --dry-run"
     echo "$cmd"
 }
@@ -2608,7 +2672,7 @@ interactive_setup() {
         # Try to auto-detect from authorized_keys
         local detected_key=""
         local key_file=""
-        for candidate in "/root/.ssh/authorized_keys" "/home/${USERNAME}/.ssh/authorized_keys"; do
+        for candidate in "/root/.ssh/authorized_keys" "$(user_home_dir "$USERNAME")/.ssh/authorized_keys"; do
             if [[ -f "$candidate" ]]; then
                 detected_key=$(grep -m1 "^ssh-" "$candidate" 2>/dev/null || true)
                 if [[ -n "$detected_key" ]]; then
@@ -2691,7 +2755,7 @@ interactive_setup() {
                     read -r
                     # Re-check for keys
                     local copied_key=""
-                    for candidate in "/root/.ssh/authorized_keys" "/home/${USERNAME}/.ssh/authorized_keys"; do
+                    for candidate in "/root/.ssh/authorized_keys" "$(user_home_dir "$USERNAME")/.ssh/authorized_keys"; do
                         if [[ -f "$candidate" ]]; then
                             copied_key=$(grep -m1 "^ssh-" "$candidate" 2>/dev/null || true)
                             if [[ -n "$copied_key" ]]; then
@@ -2850,8 +2914,9 @@ interactive_setup() {
     printf "   Sudo access:  %s\n" "${SUDO_ACCESS:-already set up}"
     printf "   Safety IP:    %s\n" "${SSH_SAFETY_IP:-<skipped>}"
     printf "   Timezone:     %s\n" "${TIMEZONE:-<skipped>}"
-    printf "   Netbird:      %s\n" "${NETBIRD_KEY:+${NETBIRD_KEY:0:8}...}"
-    [[ -z "$NETBIRD_KEY" ]] && printf "   Netbird:      %s\n" "<skipped>"
+    local netbird_display="<skipped>"
+    [[ -z "$NETBIRD_KEY" ]] || netbird_display="${NETBIRD_KEY:0:8}..."
+    printf "   Netbird:      %s\n" "$netbird_display"
     printf "   Dry run:      %s\n" "$DRY_RUN"
     echo ""
 
@@ -2864,7 +2929,7 @@ interactive_setup() {
     fi
 
     echo "   For future runs:"
-    echo -e "   ${CYAN}${cli_cmd}${NC}"
+    printf '   %b%s%b\n' "$CYAN" "$cli_cmd" "$NC"
     echo ""
 
     printf "   Proceed? [Y/n]: "
@@ -2945,7 +3010,7 @@ main() {
         local rerun_cmd
         rerun_cmd=$(build_rerun_cmd "false")
         echo -e "${YELLOW}This was a dry run. To apply changes, run:${NC}"
-        echo -e "  ${CYAN}${rerun_cmd}${NC}"
+        printf '  %b%s%b\n' "$CYAN" "$rerun_cmd" "$NC"
         if [[ "$SUDO_CHOICE_NEEDED" == "true" ]]; then
             echo -e "${YELLOW}Add --sudo-access password or --sudo-access nopasswd, or that command will stop.${NC}"
         fi

@@ -4,6 +4,8 @@
 # Each scenario boots a new container that behaves like a fresh VPS (real systemd, sshd and
 # sudo), runs vps-harden in it, then tries to get root the way its owner would: over SSH with
 # their key, typing at real sudo and su prompts. Needs Docker and nothing else.
+# The later scenarios hold the script to what it reports and prints: the scorecard's SSH row,
+# homes and groups it has to look up, and commands meant to be pasted.
 #
 # Usage: tests/lockout/run.sh [-l] [SCENARIO ...]     -l lists the scenarios
 #   BASE=debian:12     base image (default ubuntu:24.04)
@@ -620,10 +622,15 @@ scenario_the_opposite_setting_is_not_mistaken_for_it() {
 # Modules run on the left of ||, so errexit is off inside them and only explicit checks stop them.
 scenario_failed_key_ownership_still_aborts() {
     new_box
-    # chown deploy:deploy fails because their primary group has another name.
-    in_box useradd -m -s /bin/bash -g users deploy
+    # Root owns the keys, so sshd could not read them, and a read-only mount keeps chown from fixing it.
+    in_box useradd -m -s /bin/bash deploy
+    in_box install -d -m 700 /home/deploy/.ssh
+    in_box install -m 600 "$KEY" /home/deploy/.ssh/authorized_keys
+    in_box mount --bind /home/deploy/.ssh /home/deploy/.ssh
+    in_box mount -o remount,ro,bind /home/deploy/.ssh
     harden --username deploy --ssh-key "$KEY" --sudo-access nopasswd
     check "it stopped" stopped
+    check "it says why" said "Could not give deploy ownership"
     check "the user module is reported as failed" said "Critical module 'user' failed"
     check "no SSH hardening was written" no_hardening
     check "root over SSH still works" root_over_ssh
@@ -789,6 +796,249 @@ scenario_ssh_rollback_still_works() {
     check "the rollback ran" said "SSH config rolled back to prevent lockout"
     check "no SSH hardening is left" no_hardening
     check "root over SSH still works" root_over_ssh
+}
+
+# ── Scenarios: the scorecard tells the truth about SSH ───────────────────────
+SSH_OPEN="[WARN] SSH (22/tcp) open to Anywhere"
+SSH_RESTRICTED="[PASS] SSH restricted (not open to 0.0.0.0)"
+
+# ssh_row open|restricted RULE ...: reads the scorecard with only these rules in an active firewall.
+ssh_row() {
+    local expected="$1" rule
+    shift
+    in_box sh -c 'ufw --force reset; ufw default deny incoming; ufw --force enable' >/dev/null 2>&1
+    for rule in "$@"; do
+        in_box sh -c "ufw $rule" >/dev/null 2>&1 || fail "ufw refused: $rule"
+    done
+    harden --username deploy --ssh-key "$KEY" --only verify
+    if [[ "$expected" == "open" ]]; then
+        check "with [$*]: the scorecard warns" said "$SSH_OPEN"
+    else
+        check "with [$*]: the scorecard passes" said "$SSH_RESTRICTED"
+    fi
+}
+
+scenario_scorecard_warns_when_ssh_is_open() {
+    new_box
+    harden --username deploy --ssh-key "$KEY" --only verify
+    check "with the firewall off, it warns" said "$SSH_OPEN"
+    refute "with the firewall off, it does not pass" said "$SSH_RESTRICTED"
+
+    harden --username deploy --ssh-key "$KEY" --only firewall,verify
+    check "the firewall module leaves 22/tcp open" in_box sh -c 'ufw status | grep -E "^22/tcp +ALLOW +Anywhere"'
+    check "that is what it warns about" said "$SSH_OPEN"
+    refute "it does not also pass" said "$SSH_RESTRICTED"
+    harden --username deploy --ssh-key "$KEY" --dry-run
+    check "a dry run says what closes it" said "needs --netbird-key and --ssh-safety-ip"
+
+    ssh_row open 'allow 22/tcp'
+    ssh_row open 'allow ssh'
+    ssh_row open 'allow 22'
+    ssh_row open 'allow OpenSSH'
+    ssh_row open 'limit 22/tcp'
+    ssh_row open 'allow 22,80,443/tcp'
+    ssh_row open 'allow 20:30/tcp'
+    ssh_row open 'allow in on eth0 to any port 22 proto tcp'
+    ssh_row open 'allow to 203.0.113.5 port 22 proto tcp'
+    ssh_row open 'allow to 203.0.113.5'
+    ssh_row open 'allow from any'
+    ssh_row open 'allow from ::/0 to any port 22 proto tcp'
+    ssh_row open "allow 22/tcp comment 'public'"
+    ssh_row open 'default allow incoming'
+}
+
+# None of these lets a stranger reach SSH, though several say 22/tcp and Anywhere in one row.
+scenario_scorecard_passes_when_ssh_is_restricted() {
+    new_box
+    ssh_row restricted
+    ssh_row restricted 'allow in on wt0'
+    ssh_row restricted 'allow in on wt0 to any port 22 proto tcp'
+    ssh_row restricted 'allow from 203.0.113.10 to any port 22 proto tcp'
+    ssh_row restricted 'allow from 2001:db8::1 to any port 22 proto tcp'
+    ssh_row restricted 'allow from 203.0.113.10'
+    ssh_row restricted 'deny 22/tcp'
+    ssh_row restricted 'reject 22/tcp'
+    ssh_row restricted 'allow out 22/tcp'
+    ssh_row restricted 'route allow 22/tcp'
+    ssh_row restricted 'allow out on wt0'
+    ssh_row restricted 'allow 22/udp'
+    ssh_row restricted 'allow 222/tcp' 'allow 2222/tcp' 'allow 80,443/tcp' 'allow 2200:2300/tcp'
+    ssh_row restricted "allow 80/tcp comment '22/tcp ALLOW IN Anywhere'"
+    ssh_row restricted "allow from 203.0.113.10 to any port 22 proto tcp comment 'ALLOW IN Anywhere'"
+}
+
+# A veth link stands in for Netbird's wt0, so the script's own modules do the tightening.
+scenario_scorecard_follows_firewall_tighten() {
+    new_box
+    in_box ip link add wt0 type veth peer name wt0-peer
+    harden --username deploy --ssh-key "$KEY" --only firewall,firewall_tighten,verify
+    check "the tunnel rule is in" in_box sh -c 'ufw status | grep "Anywhere on wt0"'
+    # firewall_tighten only removes the broad rule when it is given a safety IP.
+    check "the broad rule is still there" in_box sh -c 'ufw status | grep -E "^22/tcp +ALLOW +Anywhere"'
+    check "so it warns" said "$SSH_OPEN"
+    harden --username deploy --ssh-key "$KEY" --ssh-safety-ip 203.0.113.10 --only firewall,firewall_tighten,verify
+    refute "the broad rule is gone" in_box sh -c 'ufw status | grep -E "^22/tcp.*ALLOW +Anywhere"'
+    check "the safety IP is in" in_box sh -c 'ufw status | grep -E "^22/tcp +ALLOW +203.0.113.10"'
+    check "so it passes" said "$SSH_RESTRICTED"
+}
+
+# ── Scenarios: the commands it prints can be pasted ──────────────────────────
+# A key with a comment a shell would trip over. sshd does not read comments, so it still logs in.
+awkward_key() {
+    printf '%s %s\n' "$(in_box cut -d' ' -f1,2 "$KEY")" "it's \$HOME \"my\" \`laptop\` a\\tb"
+}
+
+# Prints the command on the line after the one that matches.
+printed_after() { sed -n "/$1/{n;s/\r//;s/^ *//;p;q;}" "$OUT"; }
+
+# Runs a printed command as pasting it into a shell on the box would.
+paste_command() {
+    local command="$1"
+    OUT="$WORK/${SCENARIO}.$BOX_COUNT.pasted.out"
+    in_box bash -c "$command" > "$OUT" 2>&1 < /dev/null
+    RC=$?
+}
+
+scenario_printed_command_keeps_inline_key_together() {
+    new_box
+    local plain key
+    plain=$(in_box cat "$KEY")
+    harden --username deploy --ssh-key "$plain" --sudo-access nopasswd --dry-run
+    check "the dry run finishes" exited_ok
+    paste_command "$(printed_after 'To apply changes, run') --dry-run"
+    check "the printed command runs" exited_ok
+
+    harden --username deploy --ssh-key "$KEY" --sudo-access nopasswd --dry-run
+    check "a path stays as it is" said "--ssh-key $KEY --sudo-access"
+
+    key=$(awkward_key)
+    harden --username deploy --ssh-key "$key" --sudo-access nopasswd --dry-run
+    check "the dry run finishes with an awkward comment" exited_ok
+    paste_command "$(printed_after 'To apply changes, run')"
+    check "the printed command runs for real" exited_ok
+    check "the key arrives whole" in_box grep -qxF "$key" /home/deploy/.ssh/authorized_keys
+    prove_can_get_root_nopasswd deploy
+}
+
+scenario_wizard_command_keeps_pasted_key_together() {
+    new_box
+    local key
+    key=$(awkward_key)
+    tty_harden 'Username \[' deploy 'Use this key' n 'Choice \[1\]' 3 'SSH public key:' "$key" 'Choice \[1\]' 2 \
+        "${WIZARD_TAIL[@]}" 'Start with dry run' y 'Proceed\?' y --
+    check "the dry run finishes" exited_ok
+    paste_command "$(printed_after 'To apply changes, run')"
+    check "the printed command runs for real" exited_ok
+    check "the key arrives whole" in_box grep -qxF "$key" /home/deploy/.ssh/authorized_keys
+    prove_can_get_root_nopasswd deploy
+}
+
+# ── Scenarios: a home that is not /home/USER ─────────────────────────────────
+# sshd reads keys from the home in the passwd database, so that is where they have to go.
+scenario_home_elsewhere_gets_the_keys() {
+    new_box
+    in_box useradd -m -d /srv/deploy -s /bin/bash deploy
+    harden --username deploy --ssh-key "$KEY" --sudo-access nopasswd
+    check "the run reports success" exited_ok
+    check "the keys are in their home" in_box test -s /srv/deploy/.ssh/authorized_keys
+    check "the scorecard found them" said "[PASS] SSH authorized_keys has 1 key(s)"
+    refute "nothing was put in /home/deploy" in_box test -e /home/deploy
+    check "the shell settings are in their .bashrc" in_box grep -q '^umask 027' /srv/deploy/.bashrc
+    check "the SOPS config is in their home" in_box test -f /srv/deploy/.sops.yaml
+    prove_can_get_root_nopasswd deploy
+
+    in_box sh -c 'echo API_KEY=abcdefghijklmnopqrstuvwxyz123456 >> /srv/deploy/.bashrc'
+    harden --username deploy --ssh-key "$KEY" --only verify
+    check "the scorecard reads their .bashrc" said "[FAIL] Plaintext secrets in .bashrc"
+}
+
+scenario_new_user_home_follows_useradd_defaults() {
+    new_box
+    in_box useradd -D -b /srv
+    snapshot
+    harden --username deploy --ssh-key "$KEY" --sudo-access nopasswd --dry-run
+    check "the dry run names the home useradd will pick" said "Ensure /srv/deploy/.ssh exists"
+    check "nothing on the box changed" unchanged
+    harden --username deploy --ssh-key "$KEY" --sudo-access nopasswd
+    check "the run reports success" exited_ok
+    check "the keys are in their home" in_box test -s /srv/deploy/.ssh/authorized_keys
+    refute "nothing was put in /home/deploy" in_box test -e /home/deploy
+    prove_can_get_root_nopasswd deploy
+}
+
+# sshd will not read this copy, so it cannot be what lets the ssh module go ahead.
+scenario_keys_in_the_wrong_home_stop_the_ssh_module() {
+    new_box
+    in_box sh -c "useradd -m -d /srv/deploy -s /bin/bash deploy; echo 'deploy ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/deploy; chmod 440 /etc/sudoers.d/deploy"
+    in_box install -D -m 600 -o deploy -g deploy "$KEY" /home/deploy/.ssh/authorized_keys
+    harden --username deploy --ssh-key "$KEY" --skip user
+    check "it stopped" stopped
+    check "the rollback ran" said "SSH config rolled back to prevent lockout"
+    check "it names the file it looked for" said "No SSH keys found in /srv/deploy/.ssh/authorized_keys"
+    check "no SSH hardening is left" no_hardening
+    check "root over SSH still works" root_over_ssh
+}
+
+scenario_wizard_finds_keys_in_home_elsewhere() {
+    new_box
+    in_box sh -c "useradd -m -d /srv/deploy -s /bin/bash deploy; echo 'deploy ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/deploy; chmod 440 /etc/sudoers.d/deploy"
+    in_box install -D -m 600 -o deploy -g deploy "$KEY" /srv/deploy/.ssh/authorized_keys
+    in_box rm /root/.ssh/authorized_keys
+    tty_harden 'Username \[' deploy 'Use this key' y "${WIZARD_TAIL[@]}" 'Start with dry run' y 'Proceed\?' y --
+    check "the dry run finishes" exited_ok
+    check "it found them" said "Detected key from /srv/deploy/.ssh/authorized_keys"
+}
+
+# ── Scenarios: a primary group not named after the user ──────────────────────
+owned_by() { [[ $(in_box stat -c '%U:%G' "$2") == "$1" ]]; }
+
+scenario_primary_group_with_another_name_works() {
+    new_box
+    in_box useradd -m -s /bin/bash -g users deploy
+    harden --username deploy --ssh-key "$KEY" --sudo-access nopasswd
+    check "the run reports success" exited_ok
+    check "their keys are theirs" owned_by deploy:users /home/deploy/.ssh/authorized_keys
+    check "so is the SOPS config" owned_by deploy:users /home/deploy/.sops.yaml
+    prove_can_get_root_nopasswd deploy
+}
+
+# Every file the script hands over, with the home and the group both looked up.
+scenario_files_handed_over_have_the_right_owner() {
+    new_box
+    in_box useradd -m -d /srv/deploy -s /bin/bash -g users deploy
+    in_box mkdir -p /srv/agent /srv/deploy/.openclaw/workspace
+    in_box sh -c 'echo "{}" > /srv/deploy/.openclaw/openclaw.json'
+    in_box chown -R deploy:users /srv/deploy/.openclaw
+    in_box touch /srv/deploy/.openclaw/workspace/TOOLS.md
+    harden --username deploy --ssh-key "$KEY" --sudo-access nopasswd --agent-dir /srv/agent --openclaw-skill
+    check "the run reports success" exited_ok
+    local file
+    for file in /srv/deploy/.ssh/authorized_keys /srv/deploy/.sops.yaml \
+        /srv/deploy/.openclaw/openclaw.json /srv/deploy/.openclaw/workspace/TOOLS.md \
+        /srv/deploy/.openclaw/workspace/skills/server-report/SKILL.md \
+        /srv/agent/scripts/load-secrets.sh /srv/agent/logs /srv/agent/logging-config.json; do
+        check "$file is theirs" owned_by deploy:users "$file"
+    done
+    # Ubuntu 20.04 has no age package, so no key gets generated there.
+    if in_box sh -c 'command -v age-keygen' >/dev/null; then
+        check "the age key is theirs" owned_by deploy:users /srv/deploy/.config/sops/age/keys.txt
+    fi
+    prove_can_get_root_nopasswd deploy
+}
+
+# ── Scenarios: the wizard's summary ──────────────────────────────────────────
+said_once() { [[ $(grep -cF -- "$1" "$OUT") -eq 1 ]]; }
+
+scenario_wizard_summary_lists_netbird_once() {
+    new_box
+    tty_harden 'Username \[' deploy 'Use this key' y 'Choice \[1\]' 2 "${WIZARD_TAIL[@]}" \
+        'Start with dry run' y 'Proceed\?' y --
+    check "it says Netbird was skipped" said "Netbird:      <skipped>"
+    check "it says so once" said_once "Netbird:"
+    tty_harden 'Username \[' deploy 'Use this key' y 'Choice \[1\]' 2 'Safety IP.*skip' skip 'Timezone \[' skip \
+        'Netbird setup key' nbs-abcdefghij 'Start with dry run' y 'Proceed\?' y --
+    check "it shows the start of a key" said "Netbird:      nbs-abcd..."
+    check "it shows that once too" said_once "Netbird:"
 }
 
 # ── Runner ───────────────────────────────────────────────────────────────────
