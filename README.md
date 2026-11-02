@@ -197,9 +197,6 @@ All output is plain text — no colors, no control codes. Safe for piping, loggi
 | `--ssh-key KEY` | Yes* | SSH public key (file path or inline `ssh-*` string) |
 | `--sudo-access MODE` | Yes*† | How the user gets root: `password` or `nopasswd` ([details](#lockout-protection)) |
 | `--interactive` | No | Force interactive setup wizard |
-
-\* Not required when using the interactive wizard (`sudo vps-harden` with no args).
-† Only if the user cannot sudo already.
 | `--ssh-safety-ip IP` | No | IP to always allow SSH from (safety net before tightening) |
 | `--netbird-key KEY` | No | Netbird setup key for mesh VPN (skips VPN module if omitted) |
 | `--timezone TZ` | No | System timezone (e.g. `Europe/Amsterdam`, `UTC`) |
@@ -217,6 +214,10 @@ All output is plain text — no colors, no control codes. Safe for piping, loggi
 | `--verbose` | No | Show command output instead of redirecting to log |
 | `--version` | No | Print version and exit |
 | `-h`, `--help` | No | Show usage help |
+
+\* Not required when using the interactive wizard (`sudo vps-harden` with no args).
+
+† Only if the user cannot sudo already.
 
 ---
 
