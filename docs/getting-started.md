@@ -59,31 +59,46 @@ sudo vps-harden
 The wizard will:
 1. Ask for a username (auto-detects your current user)
 2. Find your SSH key (checks `authorized_keys`, or fetches from GitHub, or lets you paste one)
-3. Detect your IP for the safety-net SSH rule
-4. Detect your timezone
-5. Ask for an optional Netbird VPN key
-6. **Offer a dry run first** (recommended — shows what would change before touching anything)
+3. **Ask how that user gets root** (skipped if the user can already sudo — see [below](#how-youll-get-root))
+4. Detect your IP for the safety-net SSH rule
+5. Detect your timezone
+6. Ask for an optional Netbird VPN key
+7. **Offer a dry run first** (recommended — shows what would change before touching anything)
 
 > **Prefer CLI flags?** You can skip the wizard and pass everything directly:
 >
 > ```bash
 > sudo vps-harden --username deploy \
 >   --ssh-key "ssh-ed25519 AAAA..." \
+>   --sudo-access password \
 >   --ssh-safety-ip YOUR_LOCAL_IP \
 >   --timezone UTC \
 >   --dry-run
 > ```
 
+### How you'll get root
+
+Hardening disables root login and locks the root password, so `sudo` as your new user becomes the only way to get root. A new user has no password, so sudo wouldn't work until you pick one of these. The wizard asks; with CLI flags, use `--sudo-access`.
+
+| Choice | Flag | What you get | What to watch for |
+|--------|------|-------------|-------------------|
+| **Password** (recommended) | `--sudo-access password` | You type a password when the real run starts, and sudo asks for it. A stolen SSH key doesn't get root, and you can log in at your provider's web console if SSH ever breaks | Needs a terminal, and you need to remember it. The `ssh` module keeps SSH key-only either way |
+| **Passwordless** | `--sudo-access nopasswd` | sudo never asks. Good for automation | Whoever holds your SSH key gets root, and with no password the web console can't log you in |
+
+If your user can already sudo, for example `ubuntu` on a cloud image, you don't need either: existing passwords and rules are kept.
+
+If you run with flags and choose neither, vps-harden stops before changing anything and tells you the options.
+
 ## Step 4: Apply
 
-If you chose dry run in the wizard, review the output — every change is listed. Then run again without dry run to apply. The wizard prints the exact CLI command to re-run at the end.
+If you chose dry run in the wizard, review the output — every change is listed. Then run again without dry run to apply. The wizard prints the exact CLI command to re-run at the end. If you chose a password, you type it when the real run starts, before anything changes.
 
 Here's what each module does and why:
 
 | Step | Module | What it does | Why |
 |------|--------|-------------|-----|
-| 1 | `prereqs` | Installs foundational packages (curl, wget, jq, htop, ufw, fail2ban) | These are dependencies for the rest of the script and useful for day-to-day admin |
-| 2 | `user` | Creates a non-root user with sudo access and deploys your SSH key | Running as root is dangerous — a typo can destroy the system. A dedicated user with sudo gives you the same power with an audit trail |
+| 1 | `prereqs` | Installs foundational packages (curl, wget, jq, htop, ufw, fail2ban, sudo) | These are dependencies for the rest of the script and useful for day-to-day admin |
+| 2 | `user` | Creates a non-root user, gives it the sudo access you chose, and deploys your SSH key | Running as root is dangerous — a typo can destroy the system. A dedicated user with sudo gives you the same power with an audit trail |
 | 3 | `ssh` | Disables root login, disables password auth, limits auth attempts to 3, restricts SSH to your user only, adds a warning banner | SSH is the #1 attack surface on any VPS. Brute-force bots will find your server within minutes of it going online |
 | 4 | `firewall` | Enables UFW with deny-all-incoming, allow-all-outgoing, and an SSH exception | Without a firewall, every open port is exposed. Default-deny means only services you explicitly allow are reachable |
 | 5 | `fail2ban` | Bans IPs after 3 failed SSH attempts for 3 hours | Even with key-only SSH, bots hammering your auth log wastes resources and clutters logs. fail2ban stops them early |
@@ -106,14 +121,20 @@ Here's what each module does and why:
 | 17 | `agent_logging` | Creates log dir, logrotate, append-only flags, auditd rules | Tamper-evident logs for agent actions and API calls |
 | 18 | `agent_data` | Checks data dir permissions, gitignore, git history, encryption | Health data, user data, and PII need restricted access |
 
-> **Tip:** If a module fails, the script will continue with the remaining modules (except for the critical `user` and `ssh` modules, which abort on failure to prevent lockout).
+> **Tip:** If a module fails, the script will continue with the remaining modules (except for the critical `user` and `ssh` modules, which abort on failure to prevent lockout). The `ssh` and `misc` modules also refuse to run until your user can sudo.
 
-## Step 5: Test SSH access (important!)
+## Step 5: Test SSH and sudo (important!)
 
 **Before closing your current session**, open a **new terminal** and test. The script prints the exact command in the **Next Steps** section:
 
 ```bash
 ssh -i ~/.ssh/id_ed25519 deploy@YOUR_VPS_IP
+```
+
+Then, in that new session, check you can get root:
+
+```bash
+sudo whoami   # should print root
 ```
 
 If you have multiple SSH keys, the `-i` flag ensures the correct one is used. The script also prints a ready-to-paste `~/.ssh/config` block you can add on your local machine:
@@ -127,11 +148,11 @@ Host my-vps
 
 Then connect with just `ssh my-vps`.
 
-If this works, you're good. If it doesn't, you still have your original session to fix things.
+If both work, you're good. If they don't, you still have your original session to fix things.
 
 Once confirmed:
-- You can now `sudo` as `deploy` for any admin tasks
-- Direct root SSH login is disabled
+- You can now `sudo` as `deploy` for any admin tasks, with the password you set or without one if you chose passwordless
+- Direct root SSH login is disabled and the root password is locked
 - Password authentication is disabled (key-only)
 
 ## Step 6: Read the scorecard
@@ -174,16 +195,17 @@ At the end of the run, you'll see a grouped scorecard with section headers:
 
   ── System — OS-level security hygiene ──
   [PASS] Unattended upgrades enabled
+  [PASS] deploy can sudo (with password)
   [PASS] Root password locked
   [PASS] No plaintext secrets in .bashrc
   [PASS] authorized_keys permissions 600
 --------------------------------------------------------------------
-  SCORE: 24 PASSED | 1 WARNING | 0 FAILED
+  SCORE: 25 PASSED | 1 WARNING | 0 FAILED
 --------------------------------------------------------------------
 
   NEXT STEPS:
 
-  ⚠  IMPORTANT — Verify SSH access before closing this session!
+  ⚠  IMPORTANT — Verify SSH and sudo before closing this session!
      ...
 
   • Add this to ~/.ssh/config on your LOCAL machine:
@@ -318,6 +340,7 @@ For repeated runs, save your parameters to a file:
 # /root/harden.env
 username=deploy
 ssh_key=/home/deploy/.ssh/authorized_keys
+sudo_access=password
 ssh_safety_ip=203.0.113.10
 timezone=UTC
 ```
@@ -334,15 +357,35 @@ sudo vps-harden --config /root/harden.env
 
 Some Ubuntu versions use `ssh.service` instead of `sshd.service`. The script auto-detects this, but if you hit this error on an older version, please [open an issue](https://github.com/ranjith-src/vps-harden/issues).
 
+### "Stopping: deploy would have no way to get root"
+
+This is the lockout protection doing its job: nothing was locked. The run was about to close root, and your user has no working sudo to replace it. The message says why. Usually the fix is to re-run with `--sudo-access password` or `--sudo-access nopasswd` (see [How you'll get root](#how-youll-get-root)), or to run `sudo vps-harden` with no flags and let the wizard ask.
+
 ### Locked out after SSH hardening
 
 The script has multiple lockout safeguards (config validation, key checks, automatic rollback). But if you do get locked out:
 
 1. Use your VPS provider's **web console** (available in most dashboards)
-2. Log in as root
-3. Remove the hardening config: `rm /etc/ssh/sshd_config.d/00-hardening.conf`
-4. Restart SSH: `systemctl restart ssh`
+2. Log in as your user with its password. Root can't log in here once the `misc` module has locked its password
+3. Remove the hardening config: `sudo rm /etc/ssh/sshd_config.d/00-hardening.conf`
+4. Restart SSH: `sudo systemctl restart ssh`
 5. Fix the issue and re-run
+
+If your user has no password, the web console can't help. Use rescue mode, as described next.
+
+### sudo asks for a password that doesn't exist
+
+Before version 1.5, vps-harden could finish with a user that had no password and no passwordless sudo rule, then lock root. The scorecard still said `0 FAILED`.
+
+If you still have a root shell open, fix it there with `passwd deploy` before you close it.
+
+Otherwise, use your provider's **rescue mode**. Set a password on the server's disk from outside:
+
+1. Boot into rescue mode from your provider's dashboard
+2. Find and mount the server's root disk: run `lsblk`, then for example `mount /dev/sda1 /mnt`
+3. Set a password: `chroot /mnt passwd deploy`
+4. Leave rescue mode and boot normally
+5. SSH in as usual and check that `sudo whoami` prints `root`
 
 ### apt install hangs
 

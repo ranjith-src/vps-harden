@@ -8,7 +8,8 @@ Thanks for your interest in contributing! This project is intentionally simple â
 2. Create a feature branch: `git checkout -b my-feature`
 3. Make your changes
 4. Run the checks: `shellcheck vps-harden.sh server-report && bash -n vps-harden.sh`
-5. Submit a pull request
+5. If you touched the `user`, `ssh` or `misc` modules or the lockout protection, run `tests/lockout/run.sh` (needs Docker)
+6. Submit a pull request
 
 ## Guidelines
 

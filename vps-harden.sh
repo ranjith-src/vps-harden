@@ -79,14 +79,16 @@ detect_ssh_client_ip() {
 
 # ── Trap handler ─────────────────────────────────────────────────────────────
 cleanup() {
-    local exit_code=$?
+    local exit_code="${1:-$?}"
     if [[ $exit_code -ne 0 ]]; then
         echo ""
         echo -e "${RED}Aborted.${NC} Log file: ${LOG_FILE}"
     fi
     exit "$exit_code"
 }
-trap cleanup SIGINT SIGTERM ERR
+trap 'cleanup 130' SIGINT
+trap 'cleanup 143' SIGTERM
+trap cleanup ERR
 
 # ── Dry-run wrappers ────────────────────────────────────────────────────────
 VERBOSE="false"
@@ -140,6 +142,9 @@ SSH_KEY_CONTENT=""
 AGENT_DIR=""
 WEBHOOK_PORT="5000"
 AGENT_DATA_DIR=""
+SUDO_ACCESS=""
+SUDO_PASSWORD=""
+SUDO_CHOICE_NEEDED="false"
 
 # ── Distro detection ────────────────────────────────────────────────────────
 check_distro() {
@@ -192,6 +197,8 @@ guides you through each step with auto-detection and sensible defaults.
 Required (or use interactive wizard):
   --username USER        Non-root user to create/harden
   --ssh-key KEY          SSH public key (file path or inline string)
+  --sudo-access MODE     How the user gets root: password or nopasswd
+                         (only required if the user cannot sudo already)
 
 Optional:
   --interactive          Force interactive setup wizard
@@ -224,7 +231,7 @@ Examples:
   sudo vps-harden
 
   # New VPS:
-  sudo vps-harden --username deploy \
+  sudo vps-harden --username deploy --sudo-access password \
     --ssh-key "ssh-ed25519 AAAA..." --netbird-key "nbs-XXXX" \
     --ssh-safety-ip 203.0.113.10 --timezone Europe/Amsterdam
 
@@ -253,6 +260,7 @@ parse_config_file() {
         case "$key" in
             username)       USERNAME="$value" ;;
             ssh_key)        SSH_KEY="$value" ;;
+            sudo_access)    SUDO_ACCESS="$value" ;;
             ssh_safety_ip)  SSH_SAFETY_IP="$value" ;;
             netbird_key)    NETBIRD_KEY="$value" ;;
             timezone)       TIMEZONE="$value" ;;
@@ -273,6 +281,7 @@ parse_args() {
         case "$1" in
             --username)       USERNAME="$2"; shift 2 ;;
             --ssh-key)        SSH_KEY="$2"; shift 2 ;;
+            --sudo-access)    SUDO_ACCESS="$2"; shift 2 ;;
             --ssh-safety-ip)  SSH_SAFETY_IP="$2"; shift 2 ;;
             --netbird-key)    NETBIRD_KEY="$2"; shift 2 ;;
             --timezone)       TIMEZONE="$2"; shift 2 ;;
@@ -299,6 +308,7 @@ parse_args() {
 validate_args() {
     [[ $(id -u) -eq 0 ]] || die "This script must be run as root (use sudo)"
     [[ -n "$USERNAME" ]] || die "--username is required"
+    [[ $(id -u "$USERNAME" 2>/dev/null) != "0" ]] || die "--username must not be root: this run disables root login and locks the root password"
     [[ -n "$SSH_KEY" ]] || die "--ssh-key is required"
 
     # Resolve SSH key — could be a file path or inline key
@@ -311,6 +321,11 @@ validate_args() {
         fi
     fi
     [[ "$SSH_KEY_CONTENT" =~ ^ssh- ]] || die "--ssh-key must be a file with SSH keys or an inline ssh-* public key"
+
+    case "$SUDO_ACCESS" in
+        ""|password|nopasswd) ;;
+        *) die "--sudo-access must be password or nopasswd, not: $SUDO_ACCESS" ;;
+    esac
 }
 
 should_run() {
@@ -384,10 +399,298 @@ verify_ssh_access() {
     [[ $errors -eq 0 ]] && return 0 || return 1
 }
 
+# ── Sudo lockout protection ─────────────────────────────────────────────────
+# The ssh module disables root login and the misc module locks the root password,
+# which leaves sudo as the only way back to root. Neither runs until sudo works.
+
+password_status() {
+    passwd -S "$1" 2>/dev/null | awk '{print $2}' || true
+}
+
+# Runs a root shell for real as the user, ignoring cached credentials. sudo -l cannot
+# answer this: it lists %sudo's rule for a user with no password, and server-report's
+# narrow NOPASSWD rule makes it succeed without one.
+sudo_works_without_password() {
+    local user="$1" marker had_marker="false" rc=0
+    # Ubuntu's sudo leaves this file in a sudo group member's home the first time it works.
+    # Testing sudo is not using it, and a dry run has to leave no trace.
+    marker="$(getent passwd "$user" | cut -d: -f6)/.sudo_as_admin_successful"
+    [[ ! -e "$marker" ]] || had_marker="true"
+    runuser -u "$user" -- sudo -k -n -- /bin/sh -c 'exit 0' &>/dev/null || rc=$?
+    [[ "$had_marker" == "true" ]] || rm -f "$marker"
+    return "$rc"
+}
+
+# runuser -u bypasses the login shell, so test it on its own: nobody can log in through
+# /usr/sbin/nologin to reach sudo.
+has_login_shell() {
+    runuser "$1" -c true &>/dev/null
+}
+
+# With these set, sudo asks for root's password, which the misc module locks. sudo -l does not
+# help here: sudo-rs does not list its defaults.
+sudo_wants_root_password() {
+    grep -sqE '^[[:space:]]*Defaults[^#]*[[:space:],](rootpw|targetpw|runaspw)([[:space:],]|$)' /etc/sudoers /etc/sudoers.d/*
+}
+
+# Prints how a user gets root through sudo: "nopasswd" or "password" if they can, otherwise
+# why not: "no-sudo", "no-user", "no-shell", "no-password", "no-rule" or "root-password".
+sudo_access_state() {
+    local user="$1"
+    if ! command -v sudo &>/dev/null; then
+        echo "no-sudo"
+    elif ! id "$user" &>/dev/null; then
+        echo "no-user"
+    elif ! has_login_shell "$user"; then
+        echo "no-shell"
+    elif sudo_works_without_password "$user"; then
+        echo "nopasswd"
+    elif [[ $(password_status "$user") != "P" ]]; then
+        echo "no-password"
+    elif ! sudo -l -U "$user" /bin/sh &>/dev/null; then
+        echo "no-rule"
+    elif sudo_wants_root_password; then
+        echo "root-password"
+    else
+        echo "password"
+    fi
+}
+
+sudo_access_reason() {
+    case "$1" in
+        no-sudo)     echo "sudo is not installed" ;;
+        no-user)     echo "new user, so no password and no passwordless sudo rule" ;;
+        no-password) echo "no password and no passwordless sudo rule" ;;
+        no-rule)     echo "sudoers does not allow it" ;;
+        no-shell)    echo "no login shell, so nobody can log in to use sudo" ;;
+        root-password) echo "sudoers makes sudo ask for root's password, which gets locked" ;;
+    esac
+}
+
+# True if this run's modules give $USERNAME working sudo without --sudo-access.
+sudo_access_will_work() {
+    local state
+    state=$(sudo_access_state "$USERNAME")
+    case "$state" in
+        nopasswd|password) return 0 ;;
+        no-rule)           should_run user ;;  # adds the user to the sudo group
+        no-sudo)           should_run prereqs && should_run user && [[ $(password_status "$USERNAME") == "P" ]] ;;
+        *)                 return 1 ;;
+    esac
+}
+
+sudo_access_stop() {
+    local state="$1" outcome="$2"
+    log_fail "Stopping: $USERNAME would have no way to get root ($(sudo_access_reason "$state"))."
+    log_fail "The ssh module disables root login and the misc module locks the root password,"
+    log_fail "so sudo has to work first. After that only your provider's rescue mode could help."
+    log_fail "$outcome"
+    if [[ "$state" == "no-sudo" ]] && ! should_run prereqs; then
+        log_fail "Install sudo (apt-get install sudo), or let the prereqs module run."
+    elif [[ "$state" == "no-shell" ]]; then
+        log_fail "Give $USERNAME a login shell (chsh -s /bin/bash $USERNAME), or choose another --username."
+    elif [[ "$state" == "root-password" ]]; then
+        log_fail "Remove that setting (rootpw, targetpw or runaspw) from sudoers, or re-run with:"
+        log_fail "  --sudo-access nopasswd   add a passwordless sudo rule; whoever holds the SSH key gets root"
+    elif [[ "$state" == "no-rule" ]] && ! should_run user; then
+        log_fail "Let the user module run: it adds $USERNAME to the sudo group."
+    elif [[ "$state" == "no-rule" ]]; then
+        log_fail "$USERNAME is in the sudo group but /etc/sudoers has no rule for it. Restore that rule, or re-run with:"
+        log_fail "  --sudo-access nopasswd   add a passwordless sudo rule; whoever holds the SSH key gets root"
+    else
+        log_fail "Re-run with one of:"
+        log_fail "  --sudo-access password   set a password for $USERNAME, typed on this terminal; sudo asks for it"
+        log_fail "  --sudo-access nopasswd   add a passwordless sudo rule; whoever holds the SSH key gets root"
+        should_run user || log_fail "Both are applied by the user module, so let it run too."
+    fi
+    exit 1
+}
+
+read_sudo_password() {
+    local first second attempt
+    log_info "Choose a password for $USERNAME. sudo will ask for it."
+    for attempt in 1 2 3; do
+        printf "   New password (try %s of 3): " "$attempt"
+        IFS= read -rs first || die "No password entered. Nothing has been changed."
+        echo ""
+        printf "   Confirm password: "
+        IFS= read -rs second || die "No password entered. Nothing has been changed."
+        echo ""
+        if [[ ${#first} -lt 8 ]]; then
+            log_warn "Too short: use at least 8 characters"
+        elif [[ "$first" != "$second" ]]; then
+            log_warn "The passwords do not match"
+        else
+            SUDO_PASSWORD="$first"
+            return 0
+        fi
+    done
+    die "No password set. Nothing has been changed."
+}
+
+# Runs before any module, so a run that could not end with working sudo changes nothing.
+preflight_sudo_access() {
+    local closing="false" state
+    if should_run ssh || should_run misc; then
+        closing="true"
+    fi
+
+    # Neither --sudo-access mode can help a user who cannot log in.
+    if [[ "$closing" == "true" ]] && id "$USERNAME" &>/dev/null && ! has_login_shell "$USERNAME"; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_warn "$USERNAME would have no way to get root ($(sudo_access_reason "no-shell")): a real run would stop here"
+            return 0
+        fi
+        sudo_access_stop "no-shell" "Nothing has been changed."
+    fi
+
+    if [[ -n "$SUDO_ACCESS" ]] && should_run user; then
+        if ! command -v sudo &>/dev/null && ! should_run prereqs; then
+            if [[ "$DRY_RUN" == "true" ]]; then
+                log_warn "sudo is not installed and prereqs is not part of this run: a real run would stop here"
+                return 0
+            fi
+            sudo_access_stop "no-sudo" "Nothing has been changed."
+        fi
+        if [[ "$SUDO_ACCESS" == "password" && $(password_status "$USERNAME") != "P" ]]; then
+            if [[ ! -t 0 ]]; then
+                if [[ "$DRY_RUN" == "true" ]]; then
+                    log_warn "--sudo-access password needs a terminal: a real run from here would stop"
+                    return 0
+                fi
+                log_fail "--sudo-access password reads the password from a terminal, and stdin is not one."
+                log_fail "Nothing has been changed. Run this from a terminal, use --sudo-access nopasswd,"
+                die "or create $USERNAME and set their password yourself before running vps-harden."
+            fi
+            [[ "$DRY_RUN" == "true" ]] || read_sudo_password
+        fi
+        return 0
+    fi
+
+    # A run that keeps root open and touches no user has nothing to check.
+    if [[ "$closing" != "true" ]] && ! should_run user && [[ -z "$SUDO_ACCESS" ]]; then
+        return 0
+    fi
+
+    sudo_access_will_work && return 0
+    state=$(sudo_access_state "$USERNAME")
+
+    if [[ "$closing" == "true" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_warn "$USERNAME would have no way to get root ($(sudo_access_reason "$state")): a real run would stop here"
+            SUDO_CHOICE_NEEDED="true"
+            return 0
+        fi
+        sudo_access_stop "$state" "Nothing has been changed."
+    else
+        log_warn "$USERNAME cannot sudo yet ($(sudo_access_reason "$state")); the ssh and misc modules will refuse to run until they can"
+    fi
+}
+
+# Runs right before a module that closes a way to root.
+require_sudo_access() {
+    local mod="$1" state
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dry "Check $USERNAME can sudo before the $mod module runs"
+        return 0
+    fi
+    state=$(sudo_access_state "$USERNAME")
+    case "$state" in
+        nopasswd) log_info "Checked: $USERNAME can sudo without a password" ;;
+        password) log_info "Checked: sudoers allows $USERNAME, and $USERNAME has a password" ;;
+        no-sudo)  die "The prereqs module could not install sudo, so the $mod module did not run. Log file: $LOG_FILE" ;;
+        *)        sudo_access_stop "$state" "The $mod module did not run." ;;
+    esac
+}
+
+# sudo silently skips sudoers.d files with a dot in their name, so john.doe cannot be used as is.
+sudo_rule_file() {
+    echo "/etc/sudoers.d/vps-harden-${USERNAME//./_}"
+}
+
+install_sudo_rule() {
+    local rule_file rule tmp
+    rule_file=$(sudo_rule_file)
+    rule="${USERNAME} ALL=(ALL:ALL) NOPASSWD: ALL"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dry "Write passwordless sudo rule to $rule_file"
+        return 0
+    fi
+    command -v visudo &>/dev/null || die "sudo is not installed, so $USERNAME cannot be given a sudo rule"
+
+    if [[ -f "$rule_file" ]] && grep -qxF "$rule" "$rule_file"; then
+        log_info "Passwordless sudo rule already in $rule_file"
+    else
+        # A bad file in sudoers.d breaks sudo for everyone, so validate it first.
+        # The dot in the temporary name keeps sudo from reading it in the meantime.
+        tmp=$(mktemp /etc/sudoers.d/.vps-harden.XXXXXX) || die "Could not create a file in /etc/sudoers.d"
+        echo "$rule" > "$tmp"
+        chmod 440 "$tmp"
+        if ! visudo -cf "$tmp" &>/dev/null; then
+            rm -f "$tmp"
+            die "visudo rejected the sudo rule for $USERNAME"
+        fi
+        mv "$tmp" "$rule_file"
+        log_info "Added passwordless sudo rule in $rule_file"
+    fi
+
+    [[ $(sudo_access_state "$USERNAME") == "nopasswd" ]] || die "$USERNAME still cannot sudo without a password: check /etc/sudoers.d for a rule overriding $rule_file"
+}
+
+ensure_sudo_password() {
+    local rule_file old_password
+    rule_file=$(sudo_rule_file)
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        if [[ $(password_status "$USERNAME") == "P" ]]; then
+            log_info "$USERNAME already has a password, keeping it"
+        else
+            log_dry "Ask for a password and set it for $USERNAME"
+            [[ ! -f "$rule_file" ]] || log_dry "Remove passwordless sudo rule $rule_file once sudo accepts the password"
+        fi
+        return 0
+    fi
+
+    if [[ -z "$SUDO_PASSWORD" ]]; then
+        log_info "$USERNAME already has a password, keeping it"
+        # A password set earlier cannot be tested, and this rule may be the only proven way in.
+        if [[ -f "$rule_file" ]]; then
+            log_warn "Keeping $rule_file: remove it yourself once you have seen sudo accept the password"
+        fi
+        return 0
+    fi
+
+    old_password=$(getent shadow "$USERNAME" | cut -d: -f2)
+    printf '%s:%s\n' "$USERNAME" "$SUDO_PASSWORD" | chpasswd 2>> "$LOG_FILE" || die "Could not set a password for $USERNAME"
+    log_info "Set a password for $USERNAME"
+
+    # Prove the password gets through sudo. The passwordless rule has to be out of the way
+    # for that, or sudo would not look at the password. The dot makes sudo skip the file.
+    [[ ! -f "$rule_file" ]] || mv "$rule_file" "${rule_file}.off"
+    if ! printf '%s\n' "$SUDO_PASSWORD" | runuser -u "$USERNAME" -- sudo -S -k -p '' -- /bin/sh -c 'exit 0' &>/dev/null; then
+        [[ ! -f "${rule_file}.off" ]] || mv "${rule_file}.off" "$rule_file"
+        # Put the old password back, or the next run would take this one for a working way in.
+        printf '%s:%s\n' "$USERNAME" "$old_password" | chpasswd -e 2>> "$LOG_FILE" \
+            || log_fail "Could not put back the old password. Lock it before you re-run: passwd -l $USERNAME"
+        die "sudo rejected the new password for $USERNAME: check sudoers and PAM"
+    fi
+    if [[ -f "${rule_file}.off" ]]; then
+        rm -f "${rule_file}.off"
+        log_info "Removed passwordless sudo rule $rule_file"
+    fi
+
+    if [[ $(sudo_access_state "$USERNAME") == "nopasswd" ]]; then
+        log_warn "Another sudoers rule still lets $USERNAME sudo without a password"
+    else
+        log_info "Checked: sudo accepts the new password"
+    fi
+}
+
 # ── Module: prereqs ─────────────────────────────────────────────────────────
 mod_prereqs() {
     log_header "Module: prereqs"
-    local pkgs=(curl wget jq htop tree unzip ufw fail2ban)
+    local pkgs=(curl wget jq htop tree unzip ufw fail2ban sudo)
     local to_install=()
 
     for pkg in "${pkgs[@]}"; do
@@ -449,8 +752,15 @@ mod_user() {
         done <<< "$SSH_KEY_CONTENT"
 
         chmod 600 "$auth_file"
-        chown -R "${USERNAME}:${USERNAME}" "$ssh_dir"
+        # sshd cannot read keys the user does not own
+        chown -R "${USERNAME}:${USERNAME}" "$ssh_dir" || die "Could not give $USERNAME ownership of $ssh_dir"
     fi
+
+    # Give the user a working way to sudo
+    case "$SUDO_ACCESS" in
+        nopasswd) install_sudo_rule ;;
+        password) ensure_sudo_password ;;
+    esac
 }
 
 # ── Module: ssh ──────────────────────────────────────────────────────────────
@@ -2004,6 +2314,24 @@ mod_verify() {
         sc_add "WARN" "Unattended upgrades not configured" "will fix"
     fi
 
+    # Sudo access (root login and the root password are closed, so this is the way back)
+    local sudo_state sudo_hint
+    sudo_state=$(sudo_access_state "$USERNAME")
+    case "$sudo_state" in
+        nopasswd) sc_add "PASS" "$USERNAME can sudo (passwordless rule)" ;;
+        password) sc_add "PASS" "$USERNAME can sudo (with password)" ;;
+        *)
+            if [[ "$sudo_state" == "no-shell" ]]; then
+                sudo_hint="needs a login shell"
+            elif [[ -n "$SUDO_ACCESS" ]] && should_run user || sudo_access_will_work; then
+                sudo_hint="will fix"
+            else
+                sudo_hint="needs --sudo-access"
+            fi
+            sc_add "FAIL" "$USERNAME cannot sudo ($(sudo_access_reason "$sudo_state"))" "$sudo_hint"
+            ;;
+    esac
+
     # Root password locked
     local root_pw
     root_pw=$(passwd -S root 2>/dev/null | awk '{print $2}')
@@ -2165,10 +2493,11 @@ mod_verify() {
 
         echo -e "  ${BOLD}NEXT STEPS:${NC}"
         echo ""
-        echo -e "  ${YELLOW}⚠  IMPORTANT — Verify SSH access before closing this session!${NC}"
-        echo "     Password auth is now disabled. Open a NEW terminal and run:"
+        echo -e "  ${YELLOW}⚠  IMPORTANT — Verify SSH and sudo before closing this session!${NC}"
+        echo "     Password auth is now disabled and root is locked. Open a NEW terminal and run:"
         echo -e "       ${CYAN}ssh -i ~/.ssh/${id_file_name} ${USERNAME}@${server_ip}${NC}"
-        echo "     If you can log in, you're all set. If not, DON'T close this session."
+        echo -e "       ${CYAN}sudo whoami${NC}   # should print root"
+        echo "     If both work, you're all set. If not, DON'T close this session."
         echo ""
         echo -e "  • Add this to ${BOLD}~/.ssh/config${NC} on your LOCAL machine:"
         echo ""
@@ -2226,6 +2555,7 @@ build_rerun_cmd() {
     elif [[ -n "$SSH_KEY_CONTENT" ]]; then
         cmd+=" --ssh-key \"$(echo "$SSH_KEY_CONTENT" | head -1)\""
     fi
+    [[ -n "$SUDO_ACCESS" ]] && cmd+=" --sudo-access ${SUDO_ACCESS}"
     [[ -n "$SSH_SAFETY_IP" ]] && cmd+=" --ssh-safety-ip ${SSH_SAFETY_IP}"
     [[ -n "$TIMEZONE" ]] && cmd+=" --timezone ${TIMEZONE}"
     [[ -n "$NETBIRD_KEY" ]] && cmd+=" --netbird-key ${NETBIRD_KEY}"
@@ -2404,8 +2734,39 @@ interactive_setup() {
     fi
     echo ""
 
-    # ── Step 3: Safety IP ────────────────────────────────────────────────
-    echo -e "${BOLD}3. SSH Safety IP${NC}"
+    # ── Step 3: Sudo Access ──────────────────────────────────────────────
+    echo -e "${BOLD}3. Sudo Access${NC}"
+    echo "   Hardening disables root login and locks the root password, so sudo"
+    echo "   becomes the only way to get root. It has to work before that happens."
+    if [[ -n "$SUDO_ACCESS" ]]; then
+        echo -e "   Using: ${CYAN}${SUDO_ACCESS}${NC}"
+    elif sudo_access_will_work; then
+        echo -e "   ${GREEN}${USERNAME} already has what sudo needs.${NC} Nothing to set up."
+    else
+        local sudo_state
+        sudo_state=$(sudo_access_state "$USERNAME")
+        if [[ "$sudo_state" == "no-shell" ]]; then
+            die "$USERNAME has no login shell, so nobody could log in to use sudo. Give them one (chsh -s /bin/bash $USERNAME), or choose another username."
+        fi
+        echo ""
+        echo "   ${USERNAME} cannot use sudo yet: $(sudo_access_reason "$sudo_state")."
+        echo "   Choose one:"
+        echo "     1) Password — set one when the run starts; sudo asks for it (the ssh module keeps SSH key-only)"
+        echo "     2) Passwordless — sudo never asks, so whoever holds the SSH key gets root"
+        echo ""
+        printf "   Choice [1]: "
+        read -r choice
+        choice="${choice:-1}"
+        case "$choice" in
+            1) SUDO_ACCESS="password" ;;
+            2) SUDO_ACCESS="nopasswd" ;;
+            *) die "Invalid choice: $choice" ;;
+        esac
+    fi
+    echo ""
+
+    # ── Step 4: Safety IP ────────────────────────────────────────────────
+    echo -e "${BOLD}4. SSH Safety IP${NC}"
     echo "   A fallback IP that can always reach SSH port 22, even if the"
     echo "   VPN tunnel goes down. Usually your current public IP."
     local detected_ip
@@ -2425,8 +2786,8 @@ interactive_setup() {
     fi
     echo ""
 
-    # ── Step 4: Timezone ─────────────────────────────────────────────────
-    echo -e "${BOLD}4. Timezone${NC}"
+    # ── Step 5: Timezone ─────────────────────────────────────────────────
+    echo -e "${BOLD}5. Timezone${NC}"
     echo "   System timezone for logs and cron jobs."
     local detected_tz
     detected_tz=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo "UTC")
@@ -2440,8 +2801,8 @@ interactive_setup() {
     fi
     echo ""
 
-    # ── Step 5: Netbird Key ──────────────────────────────────────────────
-    echo -e "${BOLD}5. Netbird VPN Setup Key (optional)${NC}"
+    # ── Step 6: Netbird Key ──────────────────────────────────────────────
+    echo -e "${BOLD}6. Netbird VPN Setup Key (optional)${NC}"
     echo "   Connects this server to your Netbird mesh network."
     echo "   Get a setup key from app.netbird.io → Setup Keys."
     local default_nb="${NETBIRD_KEY:-}"
@@ -2454,8 +2815,8 @@ interactive_setup() {
     NETBIRD_KEY="${input:-$default_nb}"
     echo ""
 
-    # ── Step 6: Dry Run ──────────────────────────────────────────────────
-    echo -e "${BOLD}6. Dry Run?${NC}"
+    # ── Step 7: Dry Run ──────────────────────────────────────────────────
+    echo -e "${BOLD}7. Dry Run?${NC}"
     echo "   A dry run shows what would change without making changes."
     echo "   Recommended for the first run."
     printf "   Start with dry run? [Y/n]: "
@@ -2486,6 +2847,7 @@ interactive_setup() {
     echo -e "${BOLD}── Summary ──────────────────────────────────────────${NC}"
     printf "   Username:     %s\n" "$USERNAME"
     printf "   SSH key:      %s\n" "$key_display"
+    printf "   Sudo access:  %s\n" "${SUDO_ACCESS:-already set up}"
     printf "   Safety IP:    %s\n" "${SSH_SAFETY_IP:-<skipped>}"
     printf "   Timezone:     %s\n" "${TIMEZONE:-<skipped>}"
     printf "   Netbird:      %s\n" "${NETBIRD_KEY:+${NETBIRD_KEY:0:8}...}"
@@ -2552,9 +2914,14 @@ main() {
     [[ -n "$SKIP_MODULES" ]] && log_info "Skipping modules: $SKIP_MODULES"
     [[ -n "$ONLY_MODULES" ]] && log_info "Only modules: $ONLY_MODULES"
 
+    preflight_sudo_access
+
     # Run modules in order
     for mod in $ALL_MODULES; do
         if should_run "$mod"; then
+            case "$mod" in
+                ssh|misc) require_sudo_access "$mod" ;;
+            esac
             ( mod_"$mod" ) || {
                 case "$mod" in
                     user|ssh)
@@ -2568,6 +2935,8 @@ main() {
         else
             log_info "Skipping module: $mod"
         fi
+        # The user module has done what it needed the password for
+        [[ "$mod" != "user" ]] || SUDO_PASSWORD=""
     done
 
     echo ""
@@ -2577,6 +2946,9 @@ main() {
         rerun_cmd=$(build_rerun_cmd "false")
         echo -e "${YELLOW}This was a dry run. To apply changes, run:${NC}"
         echo -e "  ${CYAN}${rerun_cmd}${NC}"
+        if [[ "$SUDO_CHOICE_NEEDED" == "true" ]]; then
+            echo -e "${YELLOW}Add --sudo-access password or --sudo-access nopasswd, or that command will stop.${NC}"
+        fi
     fi
 }
 

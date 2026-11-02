@@ -1,0 +1,24 @@
+#!/usr/bin/expect -f
+# answer PROMPT REPLY [PROMPT REPLY ...] -- COMMAND [ARG ...]
+# Runs COMMAND on a terminal, waits for each PROMPT (a regexp) and types its REPLY
+# (the reply <ctrl-c> presses Ctrl-C),
+# then exits with COMMAND's status. The pause before typing is a person's reaction time:
+# a prompt is printed just before the program turns echo off for the password.
+set timeout 300
+set sep [lsearch -exact $argv --]
+spawn {*}[lrange $argv [expr {$sep + 1}] end]
+foreach {prompt reply} [lrange $argv 0 [expr {$sep - 1}]] {
+    expect {
+        -re $prompt {
+            after 150
+            if {$reply eq "<ctrl-c>"} { send "\003" } else { send -- "$reply\r" }
+        }
+        timeout { puts "\nanswer: timed out waiting for: $prompt"; exit 124 }
+        eof { puts "\nanswer: command ended before: $prompt"; exit 125 }
+    }
+}
+expect {
+    eof {}
+    timeout { puts "\nanswer: timed out waiting for the command to end"; exit 124 }
+}
+exit [lindex [wait] 3]
